@@ -1,0 +1,21 @@
+[Unit]
+Description=Go2W Web Monitor — LAN dashboard (status/nodes/topics/camera/teleop)
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kublab
+Group=kublab
+Environment=HOME=/home/kublab
+# Use the same Unitree CycloneDDS environment and ROS domain as the hardware
+# stack, then overlay the local workspace.
+ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor web_monitor --ros-args -p robot_ssh_host:=unitree@192.168.123.18'
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
