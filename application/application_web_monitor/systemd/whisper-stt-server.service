@@ -1,0 +1,16 @@
+[Unit]
+Description=whisper.cpp CUDA speech-to-text server — AGX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/agx_nvme/whisper.cpp
+Environment=HOME=/home/kublab
+Environment=LD_LIBRARY_PATH=/mnt/agx_nvme/whisper.cpp/build/bin:/usr/local/cuda/lib64
+ExecStart=/mnt/agx_nvme/whisper.cpp/build/bin/whisper-server --host 127.0.0.1 --port 8178 --model /mnt/agx_nvme/whisper.cpp/models/ggml-large-v3.bin --language en --threads 6 --beam-size 5 --flash-attn --suppress-nst
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

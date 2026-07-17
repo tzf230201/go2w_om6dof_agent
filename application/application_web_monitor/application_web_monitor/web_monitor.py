@@ -29,6 +29,7 @@ Options via ROS params: port (default 8080) and camera_topic.
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import os
@@ -56,7 +57,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from unitree_go.msg import WirelessController, LowState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, UInt8MultiArray
 from sensor_msgs.msg import CompressedImage
 
 # unitree_api is only needed for the "Robot Agent" chat mode (direct motion
@@ -120,6 +121,25 @@ MAX_WZ = 0.8
 MAX_DURATION = 8.0
 MAX_FORM_BODY_BYTES = 4096
 CONTROLLER_QUERY_TIMEOUT = 2.5
+
+VISION_SYSTEM = (
+    "You are the visual perception assistant for a Unitree Go2W robot. "
+    "Answer the user's question using only the attached current camera frame. "
+    "Answer in one short sentence of at most 25 words, using plain English "
+    "suitable for speech. Mention uncertainty when the image is unclear. "
+    "Do not use markdown, lists, or JSON."
+)
+VISION_PATTERNS = (
+    r"\bwhat (?:do|can) you see\b",
+    r"\bwhat(?:'s| is) (?:in|on) (?:the )?(?:camera|image|frame|front)\b",
+    r"\b(?:look|looking) (?:at|through) (?:the )?camera\b",
+    r"\bdescribe (?:the |your )?(?:camera|image|view|scene|surroundings)\b",
+    r"\b(?:camera|visual|vision) (?:view|image|result|feed)\b",
+    r"\b(?:do you|can you) see\b",
+    r"\bhow many (?:people|persons|objects|chairs|boxes|robots)\b",
+    r"\b(?:is|are) there (?:a |an |any )?(?:person|people|object|obstacle)\b",
+    r"\bwhat is (?:in front of|ahead of) (?:you|the robot)\b",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +334,22 @@ class MonitorNode(Node):
         self.camera = ForwardedImageStream(
             str(self.get_parameter("camera_topic").value),
         )
+        self.declare_parameter("audio_topic", "/application/audio/pcm_s16le")
+        self.audio = ForwardedPcmStream(
+            str(self.get_parameter("audio_topic").value),
+        )
+        self.declare_parameter(
+            "voice_active_topic", "/application/audio/voice_active")
+        self.voice_active_topic = str(
+            self.get_parameter("voice_active_topic").value)
+        self.voice_active = False
+        self.audio_source = "unknown"
+        self.stt_text = ""
+        self.stt_status = "offline"
+        self.voice_llm_response = ""
+        self.voice_llm_status = "offline"
+        self.tts_status = "offline"
+        self.tts_speaking = False
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -373,6 +409,60 @@ class MonitorNode(Node):
             self.camera.on_image,
             qos,
         )
+        self.create_subscription(
+            UInt8MultiArray,
+            self.audio.topic,
+            self.audio.on_pcm,
+            qos,
+        )
+        self.create_subscription(
+            Bool,
+            self.voice_active_topic,
+            self._on_voice_active,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/audio/format",
+            self._on_audio_format,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/stt/text",
+            self._on_stt_text,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/stt/status",
+            self._on_stt_status,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/llm/response",
+            self._on_voice_llm_response,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/llm/status",
+            self._on_voice_llm_status,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/application/tts/status",
+            self._on_tts_status,
+            grip_qos,
+        )
+        self.create_subscription(
+            Bool,
+            "/application/tts/speaking",
+            self._on_tts_speaking,
+            grip_qos,
+        )
         self.controller_list_client = None
         if ListControllers is not None:
             self.controller_list_client = self.create_client(
@@ -393,6 +483,37 @@ class MonitorNode(Node):
 
     def _on_control_mode(self, msg: String) -> None:
         self.control_mode = msg.data.strip().upper()
+
+    def _on_voice_active(self, msg: Bool) -> None:
+        self.voice_active = bool(msg.data)
+
+    def _on_audio_format(self, msg: String) -> None:
+        try:
+            source = str(json.loads(msg.data).get("source", "")).strip()
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            source = ""
+        self.audio_source = {
+            "dji_wireless_mic_rx": "DJI Wireless Mic Rx",
+            "unitree_builtin": "Unitree built-in microphone",
+        }.get(source, source or "Unitree built-in microphone")
+
+    def _on_stt_text(self, msg: String) -> None:
+        self.stt_text = msg.data.strip()
+
+    def _on_stt_status(self, msg: String) -> None:
+        self.stt_status = msg.data.strip() or "unknown"
+
+    def _on_voice_llm_response(self, msg: String) -> None:
+        self.voice_llm_response = msg.data.strip()
+
+    def _on_voice_llm_status(self, msg: String) -> None:
+        self.voice_llm_status = msg.data.strip() or "unknown"
+
+    def _on_tts_status(self, msg: String) -> None:
+        self.tts_status = msg.data.strip() or "unknown"
+
+    def _on_tts_speaking(self, msg: Bool) -> None:
+        self.tts_speaking = bool(msg.data)
 
     def _on_lowstate(self, msg: LowState) -> None:
         try:
@@ -795,6 +916,56 @@ class ForwardedImageStream:
             )
             return self.latest, self.frame_seq
 
+    def snapshot(self) -> Optional[bytes]:
+        """Return a copy of the latest recent JPEG for one-shot VLM input."""
+        with self.lock:
+            if (self.latest is None
+                    or time.monotonic() - self.last_frame
+                    >= self.ACTIVE_TIMEOUT_S):
+                return None
+            return bytes(self.latest)
+
+
+class ForwardedPcmStream:
+    """Thread-safe latest-frame stream for mono 48 kHz s16le PCM."""
+
+    ACTIVE_TIMEOUT_S = 2.0
+    SAMPLE_RATE = 48000
+    CHANNELS = 1
+
+    def __init__(self, topic: str) -> None:
+        self.topic = topic
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.latest: Optional[bytes] = None
+        self.last_frame = 0.0
+        self.frame_seq = 0
+
+    def on_pcm(self, msg: UInt8MultiArray) -> None:
+        pcm = bytes(msg.data)
+        if not pcm or len(pcm) % 2:
+            return
+        with self.cond:
+            self.latest = pcm
+            self.last_frame = time.monotonic()
+            self.frame_seq += 1
+            self.cond.notify_all()
+
+    def available(self) -> bool:
+        with self.lock:
+            return (
+                self.latest is not None
+                and time.monotonic() - self.last_frame < self.ACTIVE_TIMEOUT_S
+            )
+
+    def next_chunk(self, last_seq: int, timeout: float = 1.0):
+        with self.cond:
+            self.cond.wait_for(
+                lambda: self.frame_seq != last_seq,
+                timeout=timeout,
+            )
+            return self.latest, self.frame_seq
+
 
 # --------------------------------------------------------------------------- #
 #  System info helpers (best-effort, never raise)                             #
@@ -1170,6 +1341,54 @@ def _agent_generate(model: str, message: str
         return None, f"{model}: {exc}"
 
 
+def is_vision_question(message: str) -> bool:
+    """Recognize explicit questions that should inspect the current camera."""
+    cleaned = " ".join(message.lower().strip().split())
+    return any(re.search(pattern, cleaned) for pattern in VISION_PATTERNS)
+
+
+def _vision_generate(model: str, message: str, jpeg: bytes
+                     ) -> Tuple[Optional[str], Optional[str]]:
+    """Ask the local VLM about one current forwarded-camera JPEG."""
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": VISION_SYSTEM},
+            {
+                "role": "user",
+                "content": message,
+                "images": [base64.b64encode(jpeg).decode("ascii")],
+            },
+        ],
+        "stream": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx": 4096,
+            "num_predict": 160,
+            "temperature": 0.1,
+        },
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        OLLAMA_URL + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        reply = " ".join(str(
+            data.get("message", {}).get("content", "")).strip().split())
+        if not reply:
+            return None, "VLM returned an empty camera description."
+        return reply, None
+    except urllib.error.HTTPError as exc:
+        hint = " (the selected model may not support images)" if exc.code == 400 else ""
+        return None, f"{model}: VLM HTTP {exc.code}{hint}"
+    except Exception as exc:
+        return None, f"{model}: camera analysis failed: {exc}"
+
+
 def pick_fallback_model(exclude: str) -> Optional[str]:
     """Smallest installed Ollama model that isn't the one that just failed —
     used to auto-recover when the chosen model OOMs. Size parsed from the name."""
@@ -1182,6 +1401,16 @@ def route_agent(node: "MonitorNode", ollama_model: str, message: str
     """Chat message → local LLM (with the robot skill) → JSON action → execute.
     If the chosen model errors (typically a 7B OOMing the Orin GPU), fall back to
     the smallest other installed model and tell the user."""
+    if is_vision_question(message):
+        frame = node.camera.snapshot()
+        if frame is None:
+            return None, (
+                "Camera frame is unavailable. Wait until the camera card is "
+                "visible in the web monitor and try again.")
+        node.get_logger().info(
+            f"VLM camera question using {len(frame)}-byte current JPEG: "
+            f"{message}")
+        return _vision_generate(ollama_model, message, frame)
     if node.pub_sport is None:
         return None, ("Motion control unavailable (unitree_api package is not "
                       "imported in this node).")
@@ -1234,6 +1463,9 @@ button.stop{background:#c0392b}
 button:disabled{opacity:.55;cursor:not-allowed}
 .btn.ghost{background:#2a2e39}
 img.cam{width:100%;border-radius:8px;background:#000;min-height:220px}
+.audioctl{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.audioctl button.live{background:#c0392b}
+.audiolevel{color:#8b93a2;font-size:12px}
 .small{color:#6b7280;font-size:12px}
 ul.nodes{list-style:none;padding:0;margin:0;font-size:13px}
 ul.nodes li{padding:3px 6px;border-bottom:1px solid #23262f;display:flex;
@@ -1291,11 +1523,95 @@ async function pollStatus(){
         cameraImage.removeAttribute('src');
       }
     }
+    const audioCard=document.getElementById('audio_card');
+    if(audioCard && d.audio_available!==undefined){
+      audioCard.style.display=d.audio_available ? 'block' : 'none';
+      if(!d.audio_available && liveAudioController) stopLiveAudio();
+    }
+    const voiceBadge=document.getElementById('voice_badge');
+    if(voiceBadge && d.voice_active!==undefined){
+      voiceBadge.textContent=d.voice_active ? 'VOICE DETECTED' : 'NO VOICE DETECTED';
+      voiceBadge.className='pill '+(d.voice_active ? 'ok' : 'warn');
+    }
     const dot=document.getElementById('st_dot');
     if(dot){ dot.style.color='#4ade80'; setTimeout(()=>{dot.style.color='#6b7280';},400); }
   }catch(e){}
 }
-setInterval(pollStatus,3000); pollStatus();
+setInterval(pollStatus,1000); pollStatus();
+
+let liveAudioController=null;
+let liveAudioContext=null;
+let liveAudioNextTime=0;
+
+function setAudioUi(enabled,label){
+  const button=document.getElementById('audio_toggle');
+  const status=document.getElementById('audio_status');
+  if(button){
+    button.textContent=enabled ? '🔇 Disable live audio' : '🔊 Enable live audio';
+    button.classList.toggle('live',enabled);
+  }
+  if(status) status.textContent=label || (enabled ? 'playing microphone' : 'muted');
+}
+
+async function toggleLiveAudio(){
+  if(liveAudioController){ stopLiveAudio(); return; }
+  const AudioCtx=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtx){ setAudioUi(false,'Web Audio is not supported'); return; }
+  const controller=new AbortController();
+  const context=new AudioCtx();
+  liveAudioController=controller;
+  liveAudioContext=context;
+  liveAudioNextTime=context.currentTime+0.08;
+  setAudioUi(true,'connecting…');
+  try{
+    await context.resume();
+    const response=await fetch('/audio.pcm?'+Date.now(),{
+      cache:'no-store',signal:controller.signal
+    });
+    if(!response.ok || !response.body) throw new Error('audio HTTP '+response.status);
+    const reader=response.body.getReader();
+    let remainder=new Uint8Array(0);
+    setAudioUi(true,'live · mono 48 kHz');
+    while(true){
+      const result=await reader.read();
+      if(result.done) break;
+      let data=result.value;
+      if(remainder.length){
+        const joined=new Uint8Array(remainder.length+data.length);
+        joined.set(remainder); joined.set(data,remainder.length); data=joined;
+      }
+      const byteCount=data.length-(data.length%2);
+      remainder=data.slice(byteCount);
+      if(!byteCount) continue;
+      const samples=byteCount/2;
+      const audioBuffer=context.createBuffer(1,samples,48000);
+      const channel=audioBuffer.getChannelData(0);
+      const view=new DataView(data.buffer,data.byteOffset,byteCount);
+      for(let i=0;i<samples;i++) channel[i]=view.getInt16(i*2,true)/32768;
+      const source=context.createBufferSource();
+      source.buffer=audioBuffer; source.connect(context.destination);
+      if(liveAudioNextTime<context.currentTime+0.03 ||
+         liveAudioNextTime>context.currentTime+0.5){
+        liveAudioNextTime=context.currentTime+0.06;
+      }
+      source.start(liveAudioNextTime);
+      liveAudioNextTime+=audioBuffer.duration;
+    }
+  }catch(error){
+    if(error.name!=='AbortError') setAudioUi(false,'audio error: '+error.message);
+  }finally{
+    if(liveAudioController===controller) stopLiveAudio();
+  }
+}
+
+function stopLiveAudio(){
+  const controller=liveAudioController;
+  const context=liveAudioContext;
+  liveAudioController=null; liveAudioContext=null; liveAudioNextTime=0;
+  if(controller) controller.abort();
+  if(context) context.close().catch(()=>{});
+  setAudioUi(false,'muted · STT remains active');
+}
 
 function _log(){ return document.getElementById('chatlog'); }
 function addMsg(who,text){
@@ -1379,7 +1695,7 @@ def battery_pill(node) -> str:
     return f'<span class="pill {cls}">{soc}%{volt}{amp}</span>'
 
 
-def status_fields(node, cam=None) -> dict:
+def status_fields(node, cam=None, audio=None) -> dict:
     """The live, cheap-to-compute status cells (HTML strings). Used both for the
     initial page render and the /status.json poll. One graph query (node names)
     plus /proc reads and cached battery/gripper — light enough to poll often."""
@@ -1432,6 +1748,7 @@ def status_fields(node, cam=None) -> dict:
         )
         arm_stack = f'<span class="pill bad">{state}</span>'
     camera_available = bool(cam is not None and cam.available())
+    audio_available = bool(audio is not None and audio.available())
     return {
         "uptime": html.escape(info["uptime"]),
         "load": f'<span class="mono">{html.escape(info["load"])}</span>',
@@ -1455,10 +1772,30 @@ def status_fields(node, cam=None) -> dict:
         "dups": (f'<span class="pill bad">{dups} FOUND</span>' if dups
                  else '<span class="pill ok">none</span>'),
         "camera_available": camera_available,
+        "audio_available": audio_available,
+        "audio_source": html.escape(
+            getattr(node, "audio_source", "unknown")),
+        "voice_active": bool(getattr(node, "voice_active", False)),
+        "stt_text": html.escape(
+            getattr(node, "stt_text", "") or "Belum ada transkrip."),
+        "stt_status": html.escape(getattr(node, "stt_status", "offline")),
+        "voice_llm_response": html.escape(
+            getattr(node, "voice_llm_response", "")
+            or "Belum ada respons LLM."),
+        "voice_llm_status": html.escape(
+            getattr(node, "voice_llm_status", "offline")),
+        "tts_status": html.escape(getattr(node, "tts_status", "offline")),
+        "tts_state": (
+            "speaking · microphone paused"
+            if getattr(node, "tts_speaking", False)
+            else "listening"),
     }
 
 
-def render_page(node: MonitorNode, cam: ForwardedImageStream) -> str:
+def render_page(
+        node: MonitorNode,
+        cam: ForwardedImageStream,
+        audio: Optional[ForwardedPcmStream] = None) -> str:
     info = sys_info()
     nodes = node.nodes()
 
@@ -1472,7 +1809,7 @@ def render_page(node: MonitorNode, cam: ForwardedImageStream) -> str:
 
     # --- status card (dynamic cells carry id="st_*" and are live-updated by
     # the poller script below hitting /status.json; static cells are plain) ---
-    fields = status_fields(node, cam)
+    fields = status_fields(node, cam, audio)
     rows = [
         ("Hostname", html.escape(info["hostname"]), None),
         ("IP addresses", f'<span class="mono">{html.escape(info["ips"])}</span>', None),
@@ -1524,6 +1861,40 @@ def render_page(node: MonitorNode, cam: ForwardedImageStream) -> str:
       <img class="cam" id="camera_image"{cam_src} alt="forwarded camera stream">
       <p class="small">ROS input: <span class="mono">{html.escape(cam.topic)}</span>.
       This monitor does not open the camera device.</p>
+    </div>
+    """
+    audio_available = bool(audio is not None and audio.available())
+    audio_display = "block" if audio_available else "none"
+    audio_topic = html.escape(audio.topic if audio is not None else "")
+    voice_active = bool(getattr(node, "voice_active", False))
+    voice_class = "ok" if voice_active else "warn"
+    voice_text = "VOICE DETECTED" if voice_active else "NO VOICE DETECTED"
+    audio_html = f"""
+    <div class="card" id="audio_card" style="display:{audio_display}">
+      <h2>🎙️ Live microphone</h2>
+      <p>Source: <span class="mono" id="st_audio_source">{html.escape(getattr(node, "audio_source", "unknown"))}</span></p>
+      <p><span class="pill {voice_class}" id="voice_badge">{voice_text}</span></p>
+      <div class="audioctl">
+        <button id="audio_toggle" type="button" onclick="toggleLiveAudio()">
+          🔊 Enable live audio
+        </button>
+        <span class="audiolevel" id="audio_status">muted · STT remains active</span>
+      </div>
+      <p><strong>Speech to text</strong> ·
+        <span class="pill warn" id="st_stt_status">{html.escape(getattr(node, "stt_status", "offline"))}</span>
+      </p>
+      <p class="mono" id="st_stt_text">{html.escape(getattr(node, "stt_text", "") or "Belum ada transkrip.")}</p>
+      <p><strong>Voice Robot Agent response</strong> ·
+        <span class="pill warn" id="st_voice_llm_status">{html.escape(getattr(node, "voice_llm_status", "offline"))}</span>
+      </p>
+      <p class="mono" id="st_voice_llm_response">{html.escape(getattr(node, "voice_llm_response", "") or "Belum ada respons LLM.")}</p>
+      <p><strong>Natural robot voice</strong> ·
+        <span class="pill warn" id="st_tts_status">{html.escape(getattr(node, "tts_status", "offline"))}</span>
+        · <span id="st_tts_state">{"speaking · microphone paused" if getattr(node, "tts_speaking", False) else "listening"}</span>
+      </p>
+      <p class="small">PCM input: <span class="mono">{audio_topic}</span>.
+      This button controls playback only in this browser; speech processing on
+      the AGX remains active.</p>
     </div>
     """
     teleop_html = f"""
@@ -1662,6 +2033,7 @@ Node &amp; topic lists are now available via chat. Snapshot {now}.</p>
   </div>
   <div>
     {cam_html}
+    {audio_html}
   </div>
 </div>
 </main>
@@ -1672,7 +2044,7 @@ Node &amp; topic lists are now available via chat. Snapshot {now}.</p>
 # --------------------------------------------------------------------------- #
 #  HTTP handler                                                               #
 # --------------------------------------------------------------------------- #
-def make_handler(node: MonitorNode, cam: ForwardedImageStream):
+def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -1709,14 +2081,16 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream):
         def do_GET(self):
             if self.path.startswith("/camera.mjpg"):
                 return self._stream_camera()
+            if self.path.startswith("/audio.pcm"):
+                return self._stream_audio()
             if self.path.startswith("/status.json"):
                 try:
-                    return self._send_json(status_fields(node, cam))
+                    return self._send_json(status_fields(node, cam, audio))
                 except Exception as exc:
                     return self._send_json({"error": str(exc)}, 500)
             if self.path in ("/", "/index.html"):
                 try:
-                    return self._send_html(render_page(node, cam))
+                    return self._send_html(render_page(node, cam, audio))
                 except Exception as exc:
                     return self._send_html(
                         f"<pre>render error: {html.escape(str(exc))}</pre>", 500
@@ -1921,6 +2295,27 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def _stream_audio(self):
+            if audio is None or not audio.available():
+                return self._send_html("<pre>no live microphone stream</pre>", 503)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Audio-Format", "pcm_s16le")
+            self.send_header("X-Audio-Sample-Rate", str(audio.SAMPLE_RATE))
+            self.send_header("X-Audio-Channels", str(audio.CHANNELS))
+            self.end_headers()
+            try:
+                seq = -1
+                while audio.available():
+                    chunk, seq = audio.next_chunk(seq)
+                    if not chunk:
+                        continue
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     return Handler
 
 
@@ -1933,6 +2328,7 @@ def main(args=None):
     node.declare_parameter("port", 8080)
     port = int(node.get_parameter("port").value)
     cam = node.camera
+    audio = node.audio
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
@@ -1941,7 +2337,8 @@ def main(args=None):
     # give discovery a moment to populate the graph before first request
     time.sleep(1.5)
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(node, cam))
+    httpd = ThreadingHTTPServer(
+        ("0.0.0.0", port), make_handler(node, cam, audio))
     ip = subprocess.run(
         ["hostname", "-I"], capture_output=True, text=True
     ).stdout.split()

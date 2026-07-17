@@ -252,6 +252,73 @@ def test_forwarded_camera_is_available_only_while_frames_are_recent(monkeypatch)
     assert stream.available() is False
 
 
+def test_forwarded_camera_snapshot_returns_only_a_recent_frame(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(web_monitor.time, "monotonic", lambda: now[0])
+    stream = web_monitor.ForwardedImageStream("/camera/forwarded")
+    assert stream.snapshot() is None
+    stream.on_image(SimpleNamespace(data=b"jpeg-frame"))
+    assert stream.snapshot() == b"jpeg-frame"
+    now[0] += stream.ACTIVE_TIMEOUT_S + 0.1
+    assert stream.snapshot() is None
+
+
+@pytest.mark.parametrize("message", [
+    "what do you see",
+    "describe the camera view",
+    "is there a person in front of you",
+    "how many people are there",
+])
+def test_visual_questions_are_routed_to_the_camera(message):
+    assert web_monitor.is_vision_question(message) is True
+
+
+def test_motion_command_is_not_misrouted_to_camera():
+    assert web_monitor.is_vision_question("move forward one meter") is False
+
+
+def test_forwarded_pcm_is_available_only_while_frames_are_recent(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(web_monitor.time, "monotonic", lambda: now[0])
+    stream = web_monitor.ForwardedPcmStream("/audio/pcm")
+
+    assert stream.available() is False
+    stream.on_pcm(SimpleNamespace(data=b"\x00\x00" * 960))
+    assert stream.available() is True
+
+    now[0] += stream.ACTIVE_TIMEOUT_S + 0.1
+    assert stream.available() is False
+
+
+def test_audio_http_endpoint_is_absent_without_forwarded_pcm():
+    node = _bare_monitor()
+    camera = web_monitor.ForwardedImageStream("/camera/forwarded")
+    audio = web_monitor.ForwardedPcmStream("/audio/pcm")
+    server = web_monitor.ThreadingHTTPServer(
+        ("127.0.0.1", 0), web_monitor.make_handler(node, camera, audio)
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+    try:
+        connection.request("GET", "/audio.pcm")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 503
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_live_audio_script_has_an_explicit_browser_toggle():
+    assert "toggleLiveAudio()" in web_monitor.SCRIPTS
+    assert "stopLiveAudio()" in web_monitor.SCRIPTS
+    assert "STT remains active" in web_monitor.SCRIPTS
+    assert "VOICE DETECTED" in web_monitor.SCRIPTS
+
+
 def test_camera_http_endpoint_is_absent_without_forwarded_frames():
     node = _bare_monitor()
     stream = web_monitor.ForwardedImageStream("/camera/forwarded")

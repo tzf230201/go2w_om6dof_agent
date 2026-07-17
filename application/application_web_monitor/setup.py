@@ -29,7 +29,16 @@ setup(
     entry_points={
         "console_scripts": [
             "web_monitor = application_web_monitor.web_monitor:main",
+            "unitree_camera_relay = "
+            "application_web_monitor.unitree_camera_relay:main",
+            "unitree_audio_bridge = "
+            "application_web_monitor.unitree_audio_bridge:main",
+            "unitree_stt = application_web_monitor.unitree_stt:main",
+            "dji_audio_bridge = "
+            "application_web_monitor.dji_audio_bridge:main",
+            "stt_llm_bridge = "
+            "application_web_monitor.stt_llm_bridge:main",
+            "kokoro_tts = application_web_monitor.kokoro_tts:main",
         ],
     },
 )
-
