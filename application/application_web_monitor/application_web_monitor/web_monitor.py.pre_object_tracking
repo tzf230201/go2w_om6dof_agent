@@ -453,9 +453,6 @@ class MonitorNode(Node):
         self._pickup_lock = threading.Lock()
         self.pickup_busy = False
         self.pickup_message = "belum dijalankan"
-        self.object_tracking_active = False
-        self.object_tracking_busy = False
-        self.object_tracking_message = "belum dijalankan"
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -473,17 +470,6 @@ class MonitorNode(Node):
         self.pickup_client = self.create_client(
             Trigger, "/run_perception_pick"
         )
-        self.pickup_status_client = self.create_client(
-            Trigger, "/direct_pick_status"
-        )
-        self._pickup_status_future = None
-        self.object_tracking_start_client = self.create_client(
-            Trigger, "/direct_track"
-        )
-        self.object_tracking_stop_client = self.create_client(
-            Trigger, "/direct_stop"
-        )
-        self.create_timer(1.0, self._poll_pickup_status)
         # Sport-API publisher for chat-driven motion (Robot Agent mode). Only
         # created when unitree_api is available.
         self.pub_sport = (
@@ -599,12 +585,6 @@ class MonitorNode(Node):
             qos,
         )
         self.create_subscription(
-            String,
-            "/direct_tracking_status",
-            self._on_object_tracking_status,
-            grip_qos,
-        )
-        self.create_subscription(
             Bool,
             "/application/tts/speaking",
             self._on_tts_speaking,
@@ -714,52 +694,6 @@ class MonitorNode(Node):
     def set_perception_target(self, description: str) -> None:
         self.pub_perception_target.publish(String(data=description.strip()))
 
-    def _on_object_tracking_status(self, msg: String) -> None:
-        text = msg.data.strip()
-        with self._pickup_lock:
-            self.object_tracking_active = text.startswith("active:")
-            self.object_tracking_message = text or "status kosong"
-
-    def request_object_tracking(self, enable: bool) -> Tuple[bool, str]:
-        with self._pickup_lock:
-            if self.object_tracking_busy:
-                return False, "Perintah tracking masih diproses."
-            if enable and self.pickup_busy:
-                return False, "Pickup sedang berjalan."
-            if enable and self.remote_enabled is True:
-                return False, "Matikan remote arm (F3) sebelum tracking."
-            if enable and self.perception_distance_m is None:
-                return False, "Object perception belum terdeteksi."
-            client = (self.object_tracking_start_client if enable
-                      else self.object_tracking_stop_client)
-            if not client.service_is_ready():
-                return False, "Backend tracking belum siap."
-            self.object_tracking_busy = True
-            self.object_tracking_message = (
-                "Memulai tracking pan–tilt…" if enable
-                else "Menghentikan tracking…"
-            )
-        future = client.call_async(Trigger.Request())
-        future.add_done_callback(
-            lambda result: self._on_object_tracking_response(result, enable))
-        return True, self.object_tracking_message
-
-    def _on_object_tracking_response(self, future, requested_enable: bool) -> None:
-        try:
-            response = future.result()
-            success = bool(response.success)
-            message = response.message or (
-                "Tracking aktif." if requested_enable else "Tracking berhenti."
-            )
-        except Exception as exc:
-            success = False
-            message = f"Service tracking gagal: {exc}"
-        with self._pickup_lock:
-            self.object_tracking_busy = False
-            if success:
-                self.object_tracking_active = requested_enable
-            self.object_tracking_message = message
-
     def request_perception_pick(self) -> Tuple[bool, str]:
         with self._pickup_lock:
             if self.pickup_busy:
@@ -775,34 +709,6 @@ class MonitorNode(Node):
         future = self.pickup_client.call_async(Trigger.Request())
         future.add_done_callback(self._on_pickup_response)
         return True, self.pickup_message
-
-    def _poll_pickup_status(self) -> None:
-        future = self._pickup_status_future
-        if future is not None and not future.done():
-            return
-        if not self.pickup_status_client.service_is_ready():
-            return
-        self._pickup_status_future = self.pickup_status_client.call_async(
-            Trigger.Request())
-        self._pickup_status_future.add_done_callback(
-            self._on_pickup_status_response)
-
-    def _on_pickup_status_response(self, future) -> None:
-        try:
-            response = future.result()
-            message = response.message.strip()
-        except Exception:
-            return
-        if not message:
-            return
-        terminal_words = (
-            "COMPLETE", "FAILED", "aborted", "ready", "stopped",
-            "unreachable", "no object", "no stable object",
-        )
-        with self._pickup_lock:
-            self.pickup_message = message
-            self.pickup_busy = not any(
-                word.lower() in message.lower() for word in terminal_words)
 
     def _on_pickup_response(self, future) -> None:
         try:
@@ -1803,12 +1709,6 @@ async function pollStatus(){
       pickupButton.disabled=!!d.pickup_busy || !d.perception_active;
       pickupButton.textContent=d.pickup_busy ? '⏳ Pickup running…' : '🤖 Pickup object';
     }
-    const trackStart=document.getElementById('start_object_tracking_btn');
-    const trackStop=document.getElementById('stop_object_tracking_btn');
-    if(d.object_tracking_active!==undefined && d.object_tracking_busy!==undefined){
-      if(trackStart) trackStart.disabled=!!d.object_tracking_active || !!d.object_tracking_busy || !d.perception_active;
-      if(trackStop) trackStop.disabled=!d.object_tracking_active || !!d.object_tracking_busy;
-    }
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
     if(cameraCard && cameraImage && d.camera_available!==undefined){
@@ -2155,12 +2055,6 @@ def status_fields(node, cam=None, audio=None) -> dict:
         "pickup_message": html.escape(
             getattr(node, "pickup_message", "belum dijalankan")
         ),
-        "object_tracking_active": bool(getattr(
-            node, "object_tracking_active", False)),
-        "object_tracking_busy": bool(getattr(
-            node, "object_tracking_busy", False)),
-        "object_tracking_message": html.escape(getattr(
-            node, "object_tracking_message", "belum dijalankan")),
         "arm_stack_busy": restart_busy,
         "arm_restart_message": (
             html.escape(restart["message"])
@@ -2417,7 +2311,7 @@ def render_page(
       <p>Jarak object ↔ EoE:
       <span id="st_perception_distance">{fields["perception_distance"]}</span></p>
       <form method="POST" action="/run_perception_pick"
-            onsubmit="return confirm('Jalankan pickup visual-servo? Arm akan tracking pan–tilt, mendekat bertahap, lock kiri–kanan, maju, lalu grasp. Pastikan area aman dan remote F3 OFF.')">
+            onsubmit="return confirm('Jalankan pickup otomatis? Pastikan area arm aman, remote F3 OFF, dan object terdeteksi dengan benar.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
         <button id="pickup_object_btn" type="submit"{
             " disabled" if fields["pickup_busy"] or not perception_active else ""
@@ -2425,23 +2319,6 @@ def render_page(
       </form>
       <p class="small">Hasil pickup:
       <span id="st_pickup_message">{fields["pickup_message"]}</span></p>
-      <p>Object tracking pan–tilt:
-      <span class="mono" id="st_object_tracking_message">{fields["object_tracking_message"]}</span></p>
-      <div class="btnrow">
-        <form class="inline" method="POST" action="/start_object_tracking"
-              onsubmit="return confirm('Kamera arm akan mengikuti object kiri/kanan dan atas/bawah menggunakan joint1 + joint5. Area aman?')">
-          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button id="start_object_tracking_btn" type="submit"{
-              " disabled" if fields["object_tracking_active"] or fields["object_tracking_busy"] or not perception_active else ""
-          }>🎯 Start tracking pan–tilt</button>
-        </form>
-        <form class="inline" method="POST" action="/stop_object_tracking">
-          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button class="stop" id="stop_object_tracking_btn" type="submit"{
-              " disabled" if not fields["object_tracking_active"] or fields["object_tracking_busy"] else ""
-          }>■ Stop tracking</button>
-        </form>
-      </div>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_perception">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
@@ -2461,8 +2338,6 @@ def render_page(
       </form>
       <p class="small">Perception berjalan di robot/NX dan membuka RealSense.
       Target harus termasuk kelas COCO yang didukung YOLOX.
-      Pickup melakukan tracking pan–tilt sambil mendekat 16→12→8 cm,
-      mengunci ulang kiri–kanan, lalu advance dan grasp.
       Overlay hasil deteksi muncul pada kartu RealSense tersendiri tanpa
       menggantikan kamera bawaan robot.</p>
     </div>
@@ -2727,34 +2602,6 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     node.get_logger().warn(
                         "Perception pickup requested from web monitor."
                     )
-                else:
-                    node.get_logger().info(message)
-                return self._redirect_home()
-            if self.path in (
-                "/start_object_tracking", "/stop_object_tracking"
-            ):
-                try:
-                    form = self._read_form()
-                except (UnicodeError, ValueError) as exc:
-                    return self._send_html(
-                        "<h2>Request rejected</h2>"
-                        f"<p>{html.escape(str(exc))}</p>",
-                        413 if "exceeds" in str(exc) else 400,
-                    )
-                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
-                    node.get_logger().warn(
-                        "Rejected object tracking with invalid CSRF token.")
-                    return self._send_html(
-                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
-                        403,
-                    )
-                enable = self.path == "/start_object_tracking"
-                started, message = node.request_object_tracking(enable)
-                node.flash = message
-                if started:
-                    node.get_logger().warn(
-                        f"Object tracking {'start' if enable else 'stop'} "
-                        "requested from web monitor.")
                 else:
                     node.get_logger().info(message)
                 return self._redirect_home()

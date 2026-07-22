@@ -38,6 +38,11 @@ def _bare_monitor():
     node._controller_query_generation = 0
     node.controller_list_client = object()
     node.robot_ssh_host = ""
+    node._pickup_lock = threading.Lock()
+    node.pickup_busy = False
+    node.pickup_message = "belum dijalankan"
+    node.remote_enabled = False
+    node.perception_distance_m = 0.3
     node._logger = _Logger()
     node.get_logger = lambda: node._logger
     return node
@@ -95,6 +100,110 @@ def test_restart_uses_only_the_sudoers_whitelisted_command(monkeypatch):
     assert "shell" not in kwargs
     assert kwargs["check"] is False
     assert kwargs["timeout"] == 8.0
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_perception_control_uses_only_allowlisted_systemctl_commands(
+    monkeypatch, action,
+):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(web_monitor.subprocess, "run", fake_run)
+
+    result = web_monitor.invoke_perception_service(
+        action, "unitree@192.168.123.18"
+    )
+
+    assert result.returncode == 0
+    argv, kwargs = calls[0]
+    assert argv[:6] == [
+        "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+        "unitree@192.168.123.18",
+    ]
+    assert tuple(argv[6:]) == web_monitor.OM6DOF_PERCEPTION_COMMANDS[action]
+    assert "sudo" not in argv
+    assert "shell" not in kwargs
+    assert kwargs["check"] is False
+    assert kwargs["timeout"] == 12.0
+
+
+def test_perception_control_rejects_unknown_action_without_running_command(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        web_monitor.subprocess, "run", lambda *args, **kwargs: calls.append(args)
+    )
+
+    with pytest.raises(ValueError, match="unsupported perception action"):
+        web_monitor.invoke_perception_service("restart")
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_ddgng_control_uses_only_allowlisted_systemctl_commands(
+    monkeypatch, action,
+):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(web_monitor.subprocess, "run", fake_run)
+
+    result = web_monitor.invoke_ddgng_service(
+        action, "unitree@192.168.123.18"
+    )
+
+    assert result.returncode == 0
+    argv, kwargs = calls[0]
+    assert argv[:6] == [
+        "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+        "unitree@192.168.123.18",
+    ]
+    assert tuple(argv[6:]) == web_monitor.OM6DOF_DDGNG_COMMANDS[action]
+    assert "sudo" not in argv
+    assert "shell" not in kwargs
+    assert kwargs["check"] is False
+
+
+def test_ddgng_control_rejects_unknown_action(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        web_monitor.subprocess, "run", lambda *args, **kwargs: calls.append(args)
+    )
+
+    with pytest.raises(ValueError, match="unsupported DD-GNG action"):
+        web_monitor.invoke_ddgng_service("restart")
+
+    assert calls == []
+
+
+def test_perception_status_queries_the_remote_user_service(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(
+            stdout="ActiveState=inactive\nSubState=dead\nMainPID=0\n",
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(web_monitor.subprocess, "run", fake_run)
+
+    status = web_monitor.perception_service_status("unitree@robot")
+
+    assert status["active_state"] == "inactive"
+    assert calls[0][6:10] == [
+        "/usr/bin/systemctl", "--user", "show", "om6dof-perception.service"
+    ]
 
 
 def test_restart_worker_reports_ready_only_after_new_pid_and_nodes(monkeypatch):
@@ -277,6 +386,30 @@ def test_motion_command_is_not_misrouted_to_camera():
     assert web_monitor.is_vision_question("move forward one meter") is False
 
 
+def test_perception_status_exposes_object_to_eoe_distance():
+    node = _bare_monitor()
+    message = web_monitor.String(data=(
+        '{"target":{"state":"tracking"},'
+        '"ee":{"state":"tracking"},"distance_m":0.4123}'
+    ))
+
+    node._on_perception_status(message)
+
+    assert node.perception_tracking_status == "target=tracking, EoE=tracking"
+    assert node.perception_distance_m == pytest.approx(0.4123)
+
+
+def test_pickup_request_is_rejected_while_remote_owns_arm():
+    node = _bare_monitor()
+    node.remote_enabled = True
+    node.pickup_client = SimpleNamespace(service_is_ready=lambda: True)
+
+    started, message = node.request_perception_pick()
+
+    assert started is False
+    assert "F3" in message
+
+
 def test_forwarded_pcm_is_available_only_while_frames_are_recent(monkeypatch):
     now = [100.0]
     monkeypatch.setattr(web_monitor.time, "monotonic", lambda: now[0])
@@ -322,6 +455,9 @@ def test_live_audio_script_has_an_explicit_browser_toggle():
 def test_camera_http_endpoint_is_absent_without_forwarded_frames():
     node = _bare_monitor()
     stream = web_monitor.ForwardedImageStream("/camera/forwarded")
+    node.perception_camera = web_monitor.ForwardedImageStream(
+        "/camera/perception"
+    )
     server = web_monitor.ThreadingHTTPServer(
         ("127.0.0.1", 0), web_monitor.make_handler(node, stream)
     )
@@ -333,11 +469,24 @@ def test_camera_http_endpoint_is_absent_without_forwarded_frames():
         response = connection.getresponse()
         response.read()
         assert response.status == 503
+        connection.request("GET", "/perception.mjpg")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 503
     finally:
         connection.close()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_camera_streams_use_distinct_ros_topics_and_http_routes():
+    assert (
+        "/application_web_monitor/image/compressed"
+        != "/application_web_monitor/perception/image/compressed"
+    )
+    assert "/camera.mjpg" in web_monitor.SCRIPTS
+    assert "/perception.mjpg" in web_monitor.SCRIPTS
 
 
 def test_restart_http_endpoint_rejects_invalid_csrf_and_accepts_valid_token():
@@ -406,6 +555,66 @@ def test_restart_http_endpoint_rejects_oversized_form_without_action():
         response.read()
         assert response.status == 413
         assert calls == []
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_perception_http_controls_require_csrf_and_accept_target(monkeypatch):
+    node = _bare_monitor()
+    node.csrf_token = "known-token"
+    node.flash = ""
+    actions = []
+    targets = []
+    monkeypatch.setattr(
+        web_monitor,
+        "invoke_perception_service",
+        lambda action, ssh_host="": (
+            actions.append((action, ssh_host))
+            or SimpleNamespace(stdout="", stderr="", returncode=0)
+        ),
+    )
+    node.set_perception_target = targets.append
+    server = web_monitor.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        web_monitor.make_handler(node, SimpleNamespace()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        connection.request(
+            "POST", "/start_perception", urlencode({"csrf": "wrong"}), headers
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 403
+        assert actions == []
+
+        connection.request(
+            "POST",
+            "/start_perception",
+            urlencode({"csrf": "known-token"}),
+            headers,
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
+        assert actions == [("start", "")]
+
+        connection.request(
+            "POST",
+            "/target_perception",
+            urlencode({"csrf": "known-token", "target": "red cup"}),
+            headers,
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
+        assert targets == ["red cup"]
     finally:
         connection.close()
         server.shutdown()

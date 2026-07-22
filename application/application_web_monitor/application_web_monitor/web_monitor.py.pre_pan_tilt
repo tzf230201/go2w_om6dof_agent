@@ -473,17 +473,12 @@ class MonitorNode(Node):
         self.pickup_client = self.create_client(
             Trigger, "/run_perception_pick"
         )
-        self.pickup_status_client = self.create_client(
-            Trigger, "/direct_pick_status"
-        )
-        self._pickup_status_future = None
         self.object_tracking_start_client = self.create_client(
             Trigger, "/direct_track"
         )
         self.object_tracking_stop_client = self.create_client(
             Trigger, "/direct_stop"
         )
-        self.create_timer(1.0, self._poll_pickup_status)
         # Sport-API publisher for chat-driven motion (Robot Agent mode). Only
         # created when unitree_api is available.
         self.pub_sport = (
@@ -736,7 +731,7 @@ class MonitorNode(Node):
                 return False, "Backend tracking belum siap."
             self.object_tracking_busy = True
             self.object_tracking_message = (
-                "Memulai tracking pan–tilt…" if enable
+                "Memulai tracking kiri–kanan…" if enable
                 else "Menghentikan tracking…"
             )
         future = client.call_async(Trigger.Request())
@@ -775,34 +770,6 @@ class MonitorNode(Node):
         future = self.pickup_client.call_async(Trigger.Request())
         future.add_done_callback(self._on_pickup_response)
         return True, self.pickup_message
-
-    def _poll_pickup_status(self) -> None:
-        future = self._pickup_status_future
-        if future is not None and not future.done():
-            return
-        if not self.pickup_status_client.service_is_ready():
-            return
-        self._pickup_status_future = self.pickup_status_client.call_async(
-            Trigger.Request())
-        self._pickup_status_future.add_done_callback(
-            self._on_pickup_status_response)
-
-    def _on_pickup_status_response(self, future) -> None:
-        try:
-            response = future.result()
-            message = response.message.strip()
-        except Exception:
-            return
-        if not message:
-            return
-        terminal_words = (
-            "COMPLETE", "FAILED", "aborted", "ready", "stopped",
-            "unreachable", "no object", "no stable object",
-        )
-        with self._pickup_lock:
-            self.pickup_message = message
-            self.pickup_busy = not any(
-                word.lower() in message.lower() for word in terminal_words)
 
     def _on_pickup_response(self, future) -> None:
         try:
@@ -2417,7 +2384,7 @@ def render_page(
       <p>Jarak object ↔ EoE:
       <span id="st_perception_distance">{fields["perception_distance"]}</span></p>
       <form method="POST" action="/run_perception_pick"
-            onsubmit="return confirm('Jalankan pickup visual-servo? Arm akan tracking pan–tilt, mendekat bertahap, lock kiri–kanan, maju, lalu grasp. Pastikan area aman dan remote F3 OFF.')">
+            onsubmit="return confirm('Jalankan pickup otomatis? Pastikan area arm aman, remote F3 OFF, dan object terdeteksi dengan benar.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
         <button id="pickup_object_btn" type="submit"{
             " disabled" if fields["pickup_busy"] or not perception_active else ""
@@ -2425,15 +2392,15 @@ def render_page(
       </form>
       <p class="small">Hasil pickup:
       <span id="st_pickup_message">{fields["pickup_message"]}</span></p>
-      <p>Object tracking pan–tilt:
+      <p>Object tracking LR:
       <span class="mono" id="st_object_tracking_message">{fields["object_tracking_message"]}</span></p>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_object_tracking"
-              onsubmit="return confirm('Kamera arm akan mengikuti object kiri/kanan dan atas/bawah menggunakan joint1 + joint5. Area aman?')">
+              onsubmit="return confirm('Kamera arm akan mengikuti object hanya ke kiri/kanan menggunakan joint1. Area aman?')">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
           <button id="start_object_tracking_btn" type="submit"{
               " disabled" if fields["object_tracking_active"] or fields["object_tracking_busy"] or not perception_active else ""
-          }>🎯 Start tracking pan–tilt</button>
+          }>🎯 Start tracking LR</button>
         </form>
         <form class="inline" method="POST" action="/stop_object_tracking">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
@@ -2461,8 +2428,6 @@ def render_page(
       </form>
       <p class="small">Perception berjalan di robot/NX dan membuka RealSense.
       Target harus termasuk kelas COCO yang didukung YOLOX.
-      Pickup melakukan tracking pan–tilt sambil mendekat 16→12→8 cm,
-      mengunci ulang kiri–kanan, lalu advance dan grasp.
       Overlay hasil deteksi muncul pada kartu RealSense tersendiri tanpa
       menggantikan kamera bawaan robot.</p>
     </div>

@@ -69,12 +69,23 @@ front camera through Unitree's `videohub` API:
 ros2 run application_web_monitor unitree_camera_relay
 ```
 
-The relay yields while another publisher, such as OM6DOF perception, is sending
-processed frames. A perception overlay can therefore use the same web path:
+The two camera paths are independent:
+
+```text
+Go2W built-in camera: /application_web_monitor/image/compressed
+RealSense processing: /application_web_monitor/perception/image/compressed
+```
+
+Start perception to show the second, processed preview:
 
 ```bash
 ros2 launch om6dof_perception perception.launch.py
 ```
+
+The dashboard also provides an **OM6DOF perception** card. Its Start/Stop
+buttons control the user unit `om6dof-perception.service` on `robot_ssh_host`,
+and **Set target** publishes `/om6dof_perception/set_target`. Install the user
+service file shipped by `om6dof_perception` on the robot/NX first.
 
 ## DJI microphone and audio filter
 
