@@ -456,6 +456,9 @@ class MonitorNode(Node):
         self.object_tracking_active = False
         self.object_tracking_busy = False
         self.object_tracking_message = "belum dijalankan"
+        self.object_search_active = False
+        self.object_search_busy = False
+        self.object_search_message = "belum dijalankan"
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -483,7 +486,18 @@ class MonitorNode(Node):
         self.object_tracking_stop_client = self.create_client(
             Trigger, "/direct_stop"
         )
+        self.object_search_start_client = self.create_client(
+            Trigger, "/direct_search"
+        )
+        self.object_search_stop_client = self.create_client(
+            Trigger, "/direct_search_stop"
+        )
+        self.object_search_status_client = self.create_client(
+            Trigger, "/direct_search_status"
+        )
+        self._object_search_status_future = None
         self.create_timer(1.0, self._poll_pickup_status)
+        self.create_timer(1.0, self._poll_object_search_status)
         # Sport-API publisher for chat-driven motion (Robot Agent mode). Only
         # created when unitree_api is available.
         self.pub_sport = (
@@ -726,6 +740,8 @@ class MonitorNode(Node):
                 return False, "Perintah tracking masih diproses."
             if enable and self.pickup_busy:
                 return False, "Pickup sedang berjalan."
+            if enable and self.object_search_active:
+                return False, "Searching sedang berjalan."
             if enable and self.remote_enabled is True:
                 return False, "Matikan remote arm (F3) sebelum tracking."
             if enable and self.perception_distance_m is None:
@@ -760,10 +776,74 @@ class MonitorNode(Node):
                 self.object_tracking_active = requested_enable
             self.object_tracking_message = message
 
+    def request_object_search(self, enable: bool) -> Tuple[bool, str]:
+        with self._pickup_lock:
+            if self.object_search_busy:
+                return False, "Perintah searching masih diproses."
+            if enable and (self.pickup_busy or self.object_tracking_active):
+                return False, "Stop pickup/tracking sebelum searching."
+            if enable and self.remote_enabled is True:
+                return False, "Matikan remote arm (F3) sebelum searching."
+            client = (self.object_search_start_client if enable
+                      else self.object_search_stop_client)
+            if not client.service_is_ready():
+                return False, "Backend searching belum siap."
+            self.object_search_busy = True
+            self.object_search_message = (
+                "Memulai sweep low → medium → high…" if enable
+                else "Menghentikan searching…"
+            )
+        future = client.call_async(Trigger.Request())
+        future.add_done_callback(
+            lambda result: self._on_object_search_response(result, enable))
+        return True, self.object_search_message
+
+    def _on_object_search_response(self, future, requested_enable: bool) -> None:
+        try:
+            response = future.result()
+            success = bool(response.success)
+            message = response.message or (
+                "Searching aktif." if requested_enable
+                else "Searching berhenti."
+            )
+        except Exception as exc:
+            success = False
+            message = f"Service searching gagal: {exc}"
+        with self._pickup_lock:
+            self.object_search_busy = False
+            if success:
+                self.object_search_active = requested_enable
+            self.object_search_message = message
+
+    def _poll_object_search_status(self) -> None:
+        future = self._object_search_status_future
+        if future is not None and not future.done():
+            return
+        if not self.object_search_status_client.service_is_ready():
+            return
+        self._object_search_status_future = (
+            self.object_search_status_client.call_async(Trigger.Request()))
+        self._object_search_status_future.add_done_callback(
+            self._on_object_search_status_response)
+
+    def _on_object_search_status_response(self, future) -> None:
+        try:
+            response = future.result()
+            active = bool(response.success)
+            message = response.message.strip()
+        except Exception:
+            return
+        with self._pickup_lock:
+            self.object_search_active = active
+            if message:
+                self.object_search_message = message
+
     def request_perception_pick(self) -> Tuple[bool, str]:
         with self._pickup_lock:
             if self.pickup_busy:
                 return False, "Pickup sudah berjalan."
+            if self.object_search_active:
+                return False, "Searching sedang berjalan."
             if self.remote_enabled is True:
                 return False, "Matikan remote arm (F3) sebelum pickup."
             if self.perception_distance_m is None:
@@ -790,30 +870,33 @@ class MonitorNode(Node):
     def _on_pickup_status_response(self, future) -> None:
         try:
             response = future.result()
+            pickup_active = bool(response.success)
             message = response.message.strip()
         except Exception:
             return
         if not message:
             return
-        terminal_words = (
-            "COMPLETE", "FAILED", "aborted", "ready", "stopped",
-            "unreachable", "no object", "no stable object",
-        )
+        non_pick_status = any(text in message.lower() for text in (
+            "tracking pan-tilt", "searching low", "searching medium",
+            "searching high", "search has not run",
+        ))
         with self._pickup_lock:
-            self.pickup_message = message
-            self.pickup_busy = not any(
-                word.lower() in message.lower() for word in terminal_words)
+            self.pickup_busy = pickup_active
+            if pickup_active or not non_pick_status:
+                self.pickup_message = message
 
     def _on_pickup_response(self, future) -> None:
         try:
             response = future.result()
+            success = bool(response.success)
             message = response.message or (
-                "Pickup dimulai." if response.success else "Pickup ditolak."
+                "Pickup dimulai." if success else "Pickup ditolak."
             )
         except Exception as exc:
+            success = False
             message = f"Pickup service gagal: {exc}"
         with self._pickup_lock:
-            self.pickup_busy = False
+            self.pickup_busy = success
             self.pickup_message = message
 
     def arm_stack_missing_nodes(self) -> List[str]:
@@ -1800,14 +1883,21 @@ async function pollStatus(){
     }
     const pickupButton=document.getElementById('pickup_object_btn');
     if(pickupButton && d.pickup_busy!==undefined){
-      pickupButton.disabled=!!d.pickup_busy || !d.perception_active;
+      pickupButton.disabled=!!d.pickup_busy || !!d.object_search_active || !d.perception_active;
       pickupButton.textContent=d.pickup_busy ? '⏳ Pickup running…' : '🤖 Pickup object';
     }
     const trackStart=document.getElementById('start_object_tracking_btn');
     const trackStop=document.getElementById('stop_object_tracking_btn');
     if(d.object_tracking_active!==undefined && d.object_tracking_busy!==undefined){
-      if(trackStart) trackStart.disabled=!!d.object_tracking_active || !!d.object_tracking_busy || !d.perception_active;
+      if(trackStart) trackStart.disabled=!!d.object_tracking_active || !!d.object_tracking_busy || !!d.object_search_active || !d.perception_active;
       if(trackStop) trackStop.disabled=!d.object_tracking_active || !!d.object_tracking_busy;
+    }
+    const searchStart=document.getElementById('start_object_search_btn');
+    const searchStop=document.getElementById('stop_object_search_btn');
+    if(d.object_search_active!==undefined && d.object_search_busy!==undefined){
+      if(searchStart) searchStart.disabled=!!d.object_search_active || !!d.object_search_busy || !!d.pickup_busy || !!d.object_tracking_active || !d.perception_active;
+      if(searchStop) searchStop.disabled=!d.object_search_active || !!d.object_search_busy;
+      if(searchStart) searchStart.textContent=(d.object_search_busy || d.object_search_active) ? '⏳ Searching object…' : '🔎 Start searching state';
     }
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
@@ -2161,6 +2251,12 @@ def status_fields(node, cam=None, audio=None) -> dict:
             node, "object_tracking_busy", False)),
         "object_tracking_message": html.escape(getattr(
             node, "object_tracking_message", "belum dijalankan")),
+        "object_search_active": bool(getattr(
+            node, "object_search_active", False)),
+        "object_search_busy": bool(getattr(
+            node, "object_search_busy", False)),
+        "object_search_message": html.escape(getattr(
+            node, "object_search_message", "belum dijalankan")),
         "arm_stack_busy": restart_busy,
         "arm_restart_message": (
             html.escape(restart["message"])
@@ -2420,7 +2516,7 @@ def render_page(
             onsubmit="return confirm('Jalankan pickup visual-servo? Arm akan tracking pan–tilt, mendekat bertahap, lock kiri–kanan, maju, lalu grasp. Pastikan area aman dan remote F3 OFF.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
         <button id="pickup_object_btn" type="submit"{
-            " disabled" if fields["pickup_busy"] or not perception_active else ""
+            " disabled" if fields["pickup_busy"] or fields["object_search_active"] or not perception_active else ""
         }>🤖 Pickup object</button>
       </form>
       <p class="small">Hasil pickup:
@@ -2432,7 +2528,7 @@ def render_page(
               onsubmit="return confirm('Kamera arm akan mengikuti object kiri/kanan dan atas/bawah menggunakan joint1 + joint5. Area aman?')">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
           <button id="start_object_tracking_btn" type="submit"{
-              " disabled" if fields["object_tracking_active"] or fields["object_tracking_busy"] or not perception_active else ""
+              " disabled" if fields["object_tracking_active"] or fields["object_tracking_busy"] or fields["object_search_active"] or not perception_active else ""
           }>🎯 Start tracking pan–tilt</button>
         </form>
         <form class="inline" method="POST" action="/stop_object_tracking">
@@ -2440,6 +2536,23 @@ def render_page(
           <button class="stop" id="stop_object_tracking_btn" type="submit"{
               " disabled" if not fields["object_tracking_active"] or fields["object_tracking_busy"] else ""
           }>■ Stop tracking</button>
+        </form>
+      </div>
+      <p>Arm searching state:
+      <span class="mono" id="st_object_search_message">{fields["object_search_message"]}</span></p>
+      <div class="btnrow">
+        <form class="inline" method="POST" action="/start_object_search"
+              onsubmit="return confirm('Arm akan ke pose aman lalu menyapu joint1 center/kiri/kanan pada sudut rendah, sedang, dan tinggi. Pastikan area aman dan remote F3 OFF.')">
+          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+          <button id="start_object_search_btn" type="submit"{
+              " disabled" if fields["object_search_active"] or fields["object_search_busy"] or fields["pickup_busy"] or fields["object_tracking_active"] or not perception_active else ""
+          }>🔎 Start searching state</button>
+        </form>
+        <form class="inline" method="POST" action="/stop_object_search">
+          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+          <button class="stop" id="stop_object_search_btn" type="submit"{
+              " disabled" if not fields["object_search_active"] or fields["object_search_busy"] else ""
+          }>■ Stop searching</button>
         </form>
       </div>
       <div class="btnrow">
@@ -2461,8 +2574,13 @@ def render_page(
       </form>
       <p class="small">Perception berjalan di robot/NX dan membuka RealSense.
       Target harus termasuk kelas COCO yang didukung YOLOX.
-      Pickup melakukan tracking pan–tilt sambil mendekat 16→12→8 cm,
-      mengunci ulang kiri–kanan, lalu advance dan grasp.
+      Searching menyapu pandangan rendah → sedang → tinggi dan baru berhenti
+      sebagai FOUND setelah target terdeteksi pada 10 frame berturut-turut.
+      Pickup melakukan tracking pan–tilt sambil mendekat pada ray 3D langsung
+      menuju object (tidak dipaksa horizontal) pada jarak 16→12→8 cm,
+      mengunci ulang kiri–kanan dan atas–bawah, lalu advance dekat dan grasp.
+      Target rendah otomatis memakai upper-surface dari 3D bounding box:
+      hover di atas object lalu descend vertikal sebelum grasp.
       Overlay hasil deteksi muncul pada kartu RealSense tersendiri tanpa
       menggantikan kamera bawaan robot.</p>
     </div>
@@ -2754,6 +2872,34 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 if started:
                     node.get_logger().warn(
                         f"Object tracking {'start' if enable else 'stop'} "
+                        "requested from web monitor.")
+                else:
+                    node.get_logger().info(message)
+                return self._redirect_home()
+            if self.path in (
+                "/start_object_search", "/stop_object_search"
+            ):
+                try:
+                    form = self._read_form()
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_html(
+                        "<h2>Request rejected</h2>"
+                        f"<p>{html.escape(str(exc))}</p>",
+                        413 if "exceeds" in str(exc) else 400,
+                    )
+                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                    node.get_logger().warn(
+                        "Rejected object search with invalid CSRF token.")
+                    return self._send_html(
+                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
+                        403,
+                    )
+                enable = self.path == "/start_object_search"
+                started, message = node.request_object_search(enable)
+                node.flash = message
+                if started:
+                    node.get_logger().warn(
+                        f"Object search {'start' if enable else 'stop'} "
                         "requested from web monitor.")
                 else:
                     node.get_logger().info(message)
