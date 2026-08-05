@@ -87,10 +87,10 @@ NOT "say".
 Converting distances and angles (the robot cannot measure distance, so approximate
 with time at a safe speed):
   - Forward/back distance: use speed 0.3 m/s. duration = distance_metres / 0.3,
-    capped at 8 s. E.g. "maju 1 meter" -> vx 0.3, duration 3.3.
+    capped at 8 s. E.g. "move forward 1 meter" -> vx 0.3, duration 3.3.
   - Turn angle: use speed 0.6 rad/s. duration = angle_radians / 0.6.
     A quarter turn (90 deg) = 1.57 rad -> duration ~2.6 s. Half turn (180) -> ~5.2 s.
-  - If no distance/angle is given (e.g. "maju sedikit"), use a short 1.5 s move.
+  - If no distance/angle is given (e.g. "move forward a little"), use a short 1.5 s move.
 
 Safety rules:
   - Never exceed the stated ranges. Clamp anything larger.

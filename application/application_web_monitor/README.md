@@ -15,6 +15,22 @@ Open `http://<agx-ip>:8080` from the trusted robot LAN. The HTTP server binds to
 all interfaces and currently has no login, so it must not be exposed directly
 to an untrusted network.
 
+## Top status ribbon
+
+The sticky header keeps the most useful live values visible while the page is
+scrolled:
+
+- the browser's local time in `HH:MM` format;
+- RAM usage as a memory-chip gauge and percentage;
+- robot battery state of charge as a battery gauge and percentage.
+
+Hover over the RAM or battery indicator to see the detailed value. RAM details
+show used and total memory, while battery details show voltage and current. The
+header values are refreshed from `/status.json` once per second without a page
+reload. RAM is green below 70%, amber from 70% through 84%, and red at 85% or
+higher. Battery is green at 40% or higher, amber from 20% through 39%, and red
+below 20%.
+
 ## Current pipeline
 
 ```text

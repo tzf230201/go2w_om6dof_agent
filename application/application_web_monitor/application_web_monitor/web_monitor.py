@@ -13,15 +13,19 @@ on the same network. It shows:
                     ROS. The card only appears while forwarded frames arrive;
                     this process never opens the camera device itself.
   * Remote toggle — a button that publishes a momentary F3 tap onto
-                    /wirelesscontroller. F3 switches controller ownership
-                    between autonomous and remote control.
+                     /wirelesscontroller. F3 switches controller ownership
+                     between autonomous and remote control.
+  * Arm targets   — live JOINT, CARTESIAN, and CYLINDRICAL absolute-target
+                    forms with current-feedback fill, controller status, and
+                    a target-only stop button.
   * OM6DOF restart — a guarded, asynchronous restart of the single systemd
                      unit that owns bringup, the command converter, and teleop.
   * Perception    — guarded start/stop controls for OM6DOF perception on the
                     robot host; its processed stream appears in Camera.
 
-The page itself refreshes ONLY when you reload / press Refresh (the camera is a
-separate live stream). Data is read on demand.
+Status is refreshed in place once per second and control forms use AJAX, so
+normal operation does not reload the page. The camera is a separate live
+stream.
 
 Run:
     ros2 run application_web_monitor web_monitor
@@ -79,6 +83,7 @@ OM6DOF_SERVICE = "om6dof-hardware.service"
 OM6DOF_PERCEPTION_SERVICE = "om6dof-perception.service"
 OM6DOF_PICK_SERVICE = "om6dof-perception-pick.service"
 OM6DOF_DDGNG_SERVICE = "om6dof-dd-gng.service"
+PICKUP_STATUS_TIMEOUT_S = 3.0
 OM6DOF_REQUIRED_NODES = frozenset({
     "controller_manager",
     "om6dof_controller",
@@ -452,13 +457,20 @@ class MonitorNode(Node):
         self.perception_distance_m = None
         self._pickup_lock = threading.Lock()
         self.pickup_busy = False
-        self.pickup_message = "belum dijalankan"
+        self.pickup_message = "not run yet"
         self.object_tracking_active = False
         self.object_tracking_busy = False
-        self.object_tracking_message = "belum dijalankan"
+        self.object_tracking_message = "not run yet"
         self.object_search_active = False
         self.object_search_busy = False
-        self.object_search_message = "belum dijalankan"
+        self.object_search_message = "not run yet"
+        self.arm_target_active = False
+        self.arm_target_state = "idle"
+        self.arm_target_mode = ""
+        self.arm_target_request_id = ""
+        self.arm_target_message = "no target yet"
+        self.arm_target_goal = None
+        self.arm_target_current = {}
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -470,6 +482,9 @@ class MonitorNode(Node):
         self.pub_operation_mode = self.create_publisher(
             String, "/om6dof/operation_mode", 10
         )
+        self.pub_arm_target = self.create_publisher(
+            String, "/om6dof/target_cmd", 10
+        )
         self.pub_perception_target = self.create_publisher(
             String, "/om6dof_perception/set_target", 10
         )
@@ -480,6 +495,8 @@ class MonitorNode(Node):
             Trigger, "/direct_pick_status"
         )
         self._pickup_status_future = None
+        self._pickup_status_future_started = 0.0
+        self._pickup_status_generation = 0
         self.object_tracking_start_client = self.create_client(
             Trigger, "/direct_track"
         )
@@ -532,6 +549,12 @@ class MonitorNode(Node):
             String,
             "/om6dof/operation_mode/state",
             self._on_control_mode,
+            grip_qos,
+        )
+        self.create_subscription(
+            String,
+            "/om6dof/target_status",
+            self._on_arm_target_status,
             grip_qos,
         )
         # Battery from /lowstate (~500 Hz). The callback only stores the latest
@@ -645,6 +668,59 @@ class MonitorNode(Node):
     def _on_control_mode(self, msg: String) -> None:
         self.control_mode = msg.data.strip().upper()
 
+    def _on_arm_target_status(self, msg: String) -> None:
+        try:
+            status = json.loads(msg.data)
+            if not isinstance(status, dict):
+                raise ValueError("target status must be an object")
+            state = str(status.get("state", "unknown")).strip().lower()
+            allowed_states = {
+                "idle", "requesting", "running", "reached", "rejected",
+                "stopping", "stopped", "timeout", "blocked",
+            }
+            if state not in allowed_states:
+                state = "unknown"
+            mode = str(status.get("mode", "")).strip().upper()
+            if mode not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+                mode = ""
+            current = status.get("current", {})
+            if not isinstance(current, dict):
+                current = {}
+            clean_current = {}
+            for key in ("joint", "cartesian", "cylindrical"):
+                try:
+                    values = [float(value) for value in current.get(key, ())]
+                except (TypeError, ValueError):
+                    continue
+                if len(values) == 6 and all(math.isfinite(value) for value in values):
+                    clean_current[key] = values
+            goal = status.get("goal")
+            if goal is not None:
+                try:
+                    goal = [float(value) for value in goal]
+                except (TypeError, ValueError):
+                    goal = None
+                if goal is not None and (
+                    len(goal) != 6
+                    or not all(math.isfinite(value) for value in goal)
+                ):
+                    goal = None
+            self.arm_target_active = bool(status.get("active", state == "running"))
+            self.arm_target_state = state
+            self.arm_target_mode = mode
+            self.arm_target_request_id = str(status.get("request_id", ""))[:80]
+            self.arm_target_message = (
+                "no target yet"
+                if state == "idle"
+                else str(status.get(
+                    "message", "target status has no message"
+                ))[:500]
+            )
+            self.arm_target_goal = goal
+            self.arm_target_current = clean_current
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.get_logger().warn("Ignoring malformed /om6dof/target_status")
+
     def _on_voice_active(self, msg: Bool) -> None:
         self.voice_active = bool(msg.data)
 
@@ -725,6 +801,87 @@ class MonitorNode(Node):
     def set_operation_mode(self, mode: str) -> None:
         self.pub_operation_mode.publish(String(data=mode.strip().upper()))
 
+    def request_arm_target(
+        self, mode: str, values: List[float]
+    ) -> Tuple[bool, str]:
+        normalized = str(mode).strip().upper()
+        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+            return False, "Target rejected: invalid mode."
+        try:
+            target = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return False, "Target rejected: all values must be numbers."
+        if len(target) != 6 or not all(math.isfinite(value) for value in target):
+            return False, "Target rejected: exactly six finite numbers are required."
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, (
+                    "Target rejected: enable remote arm control and wait for "
+                    "READY to finish."
+                )
+            if self.control_mode not in (
+                "JOINT", "CARTESIAN", "CYLINDRICAL"
+            ):
+                return False, (
+                    "Target rejected: the controller has not finished READY."
+                )
+            if self.pickup_busy:
+                return False, "Target rejected: pickup is running."
+            if self.object_tracking_active or self.object_tracking_busy:
+                return False, "Target rejected: tracking is running."
+            if self.object_search_active or self.object_search_busy:
+                return False, "Target rejected: search is running."
+            if self._arm_restart_phase == "restarting":
+                return False, "Target rejected: the OM6DOF stack is restarting."
+            if self.arm_target_active:
+                return False, (
+                    "Target rejected: another target is still running; press "
+                    "Stop target."
+                )
+            request_id = secrets.token_hex(8)
+            payload = json.dumps({
+                "action": "move",
+                "mode": normalized,
+                "values": target,
+                "request_id": request_id,
+            }, separators=(",", ":"), allow_nan=False)
+            self.arm_target_active = True
+            self.arm_target_state = "requesting"
+            self.arm_target_mode = normalized
+            self.arm_target_request_id = request_id
+            self.arm_target_goal = target
+            self.arm_target_message = f"Sending {normalized} target…"
+        try:
+            self.pub_arm_target.publish(String(data=payload))
+        except Exception as exc:
+            with self._pickup_lock:
+                self.arm_target_active = False
+                self.arm_target_state = "rejected"
+                self.arm_target_message = f"Failed to send target: {exc}"
+            return False, self.arm_target_message
+        return True, (
+            f"{normalized} target sent; wait for the controller status."
+        )
+
+    def request_arm_target_stop(self) -> Tuple[bool, str]:
+        request_id = secrets.token_hex(8)
+        payload = json.dumps({
+            "action": "stop", "request_id": request_id,
+        }, separators=(",", ":"))
+        with self._pickup_lock:
+            was_active = self.arm_target_active
+            self.arm_target_state = "stopping"
+            self.arm_target_request_id = request_id
+            self.arm_target_message = "Sending Stop target…"
+        try:
+            self.pub_arm_target.publish(String(data=payload))
+        except Exception as exc:
+            with self._pickup_lock:
+                self.arm_target_state = "blocked" if was_active else "rejected"
+                self.arm_target_message = f"Failed to send Stop target: {exc}"
+            return False, self.arm_target_message
+        return True, "Stop target sent; the controller will hold the arm position."
+
     def set_perception_target(self, description: str) -> None:
         self.pub_perception_target.publish(String(data=description.strip()))
 
@@ -732,28 +889,28 @@ class MonitorNode(Node):
         text = msg.data.strip()
         with self._pickup_lock:
             self.object_tracking_active = text.startswith("active:")
-            self.object_tracking_message = text or "status kosong"
+            self.object_tracking_message = text or "empty status"
 
     def request_object_tracking(self, enable: bool) -> Tuple[bool, str]:
         with self._pickup_lock:
             if self.object_tracking_busy:
-                return False, "Perintah tracking masih diproses."
+                return False, "The tracking command is still being processed."
             if enable and self.pickup_busy:
-                return False, "Pickup sedang berjalan."
+                return False, "Pickup is running."
             if enable and self.object_search_active:
-                return False, "Searching sedang berjalan."
+                return False, "Search is running."
             if enable and self.remote_enabled is True:
-                return False, "Matikan remote arm (F3) sebelum tracking."
+                return False, "Disable remote arm control (F3) before tracking."
             if enable and self.perception_distance_m is None:
-                return False, "Object perception belum terdeteksi."
+                return False, "No perception object has been detected yet."
             client = (self.object_tracking_start_client if enable
                       else self.object_tracking_stop_client)
             if not client.service_is_ready():
-                return False, "Backend tracking belum siap."
+                return False, "The tracking backend is not ready."
             self.object_tracking_busy = True
             self.object_tracking_message = (
-                "Memulai tracking pan–tilt…" if enable
-                else "Menghentikan tracking…"
+                "Starting pan–tilt tracking…" if enable
+                else "Stopping tracking…"
             )
         future = client.call_async(Trigger.Request())
         future.add_done_callback(
@@ -765,11 +922,11 @@ class MonitorNode(Node):
             response = future.result()
             success = bool(response.success)
             message = response.message or (
-                "Tracking aktif." if requested_enable else "Tracking berhenti."
+                "Tracking active." if requested_enable else "Tracking stopped."
             )
         except Exception as exc:
             success = False
-            message = f"Service tracking gagal: {exc}"
+            message = f"Tracking service failed: {exc}"
         with self._pickup_lock:
             self.object_tracking_busy = False
             if success:
@@ -779,19 +936,19 @@ class MonitorNode(Node):
     def request_object_search(self, enable: bool) -> Tuple[bool, str]:
         with self._pickup_lock:
             if self.object_search_busy:
-                return False, "Perintah searching masih diproses."
+                return False, "The search command is still being processed."
             if enable and (self.pickup_busy or self.object_tracking_active):
-                return False, "Stop pickup/tracking sebelum searching."
+                return False, "Stop pickup/tracking before starting the search."
             if enable and self.remote_enabled is True:
-                return False, "Matikan remote arm (F3) sebelum searching."
+                return False, "Disable remote arm control (F3) before searching."
             client = (self.object_search_start_client if enable
                       else self.object_search_stop_client)
             if not client.service_is_ready():
-                return False, "Backend searching belum siap."
+                return False, "The search backend is not ready."
             self.object_search_busy = True
             self.object_search_message = (
-                "Memulai sweep low → medium → high…" if enable
-                else "Menghentikan searching…"
+                "Starting low → medium → high sweep…" if enable
+                else "Stopping search…"
             )
         future = client.call_async(Trigger.Request())
         future.add_done_callback(
@@ -803,12 +960,12 @@ class MonitorNode(Node):
             response = future.result()
             success = bool(response.success)
             message = response.message or (
-                "Searching aktif." if requested_enable
-                else "Searching berhenti."
+                "Search active." if requested_enable
+                else "Search stopped."
             )
         except Exception as exc:
             success = False
-            message = f"Service searching gagal: {exc}"
+            message = f"Search service failed: {exc}"
         with self._pickup_lock:
             self.object_search_busy = False
             if success:
@@ -841,33 +998,53 @@ class MonitorNode(Node):
     def request_perception_pick(self) -> Tuple[bool, str]:
         with self._pickup_lock:
             if self.pickup_busy:
-                return False, "Pickup sudah berjalan."
+                return False, "Pickup is already running."
             if self.object_search_active:
-                return False, "Searching sedang berjalan."
+                return False, "Search is running."
             if self.remote_enabled is True:
-                return False, "Matikan remote arm (F3) sebelum pickup."
+                return False, "Disable remote arm control (F3) before pickup."
             if self.perception_distance_m is None:
-                return False, "Target atau jarak EoE belum valid."
+                return False, "The target or EoE distance is not valid yet."
             if not self.pickup_client.service_is_ready():
-                return False, "Pickup backend belum siap; start perception lagi."
+                return False, "The pickup backend is not ready; restart perception."
             self.pickup_busy = True
-            self.pickup_message = "Pickup request dikirim; menunggu backend."
+            self.pickup_message = "Pickup request sent; waiting for the backend."
         future = self.pickup_client.call_async(Trigger.Request())
         future.add_done_callback(self._on_pickup_response)
         return True, self.pickup_message
 
     def _poll_pickup_status(self) -> None:
+        now = time.monotonic()
         future = self._pickup_status_future
         if future is not None and not future.done():
-            return
+            if now - self._pickup_status_future_started \
+                    < PICKUP_STATUS_TIMEOUT_S:
+                return
+            # A ROS service Future can remain pending forever when its server
+            # restarts between discovery and response. Remove it and issue a
+            # fresh request; otherwise pickup_busy remains frozen in the GUI.
+            try:
+                self.pickup_status_client.remove_pending_request(future)
+            except Exception:
+                pass
+            self._pickup_status_generation += 1
+            self._pickup_status_future = None
+            self.get_logger().warn(
+                "Pickup status request timed out; retrying with a fresh request.")
         if not self.pickup_status_client.service_is_ready():
             return
+        self._pickup_status_generation += 1
+        generation = self._pickup_status_generation
         self._pickup_status_future = self.pickup_status_client.call_async(
             Trigger.Request())
+        self._pickup_status_future_started = now
         self._pickup_status_future.add_done_callback(
-            self._on_pickup_status_response)
+            lambda completed: self._on_pickup_status_response(
+                completed, generation))
 
-    def _on_pickup_status_response(self, future) -> None:
+    def _on_pickup_status_response(self, future, generation: int) -> None:
+        if generation != self._pickup_status_generation:
+            return
         try:
             response = future.result()
             pickup_active = bool(response.success)
@@ -890,11 +1067,11 @@ class MonitorNode(Node):
             response = future.result()
             success = bool(response.success)
             message = response.message or (
-                "Pickup dimulai." if success else "Pickup ditolak."
+                "Pickup started." if success else "Pickup rejected."
             )
         except Exception as exc:
             success = False
-            message = f"Pickup service gagal: {exc}"
+            message = f"Pickup service failed: {exc}"
         with self._pickup_lock:
             self.pickup_busy = success
             self.pickup_message = message
@@ -1356,11 +1533,17 @@ def sys_info() -> dict:
         if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:"):
             mem[parts[0]] = int(parts[1])
     if "MemTotal:" in mem and "MemAvailable:" in mem:
-        used = (mem["MemTotal:"] - mem["MemAvailable:"]) / 1e6
-        total = mem["MemTotal:"] / 1e6
+        used_kb = mem["MemTotal:"] - mem["MemAvailable:"]
+        total_kb = mem["MemTotal:"]
+        used = used_kb / 1e6
+        total = total_kb / 1e6
         info["ram"] = f"{used:.1f} / {total:.1f} GB"
+        info["ram_percent"] = max(
+            0, min(100, round(used_kb * 100 / total_kb))
+        )
     else:
         info["ram"] = "?"
+        info["ram_percent"] = None
     # CPU temp: highest thermal zone reading
     temps = []
     for zone in range(12):
@@ -1790,9 +1973,35 @@ def route_agent(node: "MonitorNode", ollama_model: str, message: str
 CSS = """
 :root{color-scheme:dark}
 body{font-family:system-ui,sans-serif;margin:0;background:#12141a;color:#e6e6e6}
-header{background:#1c1f27;padding:14px 20px;display:flex;align-items:center;
-  justify-content:space-between;border-bottom:1px solid #2a2e39}
+header{position:sticky;top:0;z-index:900;background:#1c1f27;padding:14px 20px;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  flex-wrap:wrap;border-bottom:1px solid #2a2e39;box-shadow:0 5px 18px #0005}
 h1{font-size:18px;margin:0}
+.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  flex-wrap:wrap}
+.header-clock{display:inline-flex;align-items:center;min-height:26px;padding:4px 9px;
+  border:1px solid #343a48;border-radius:999px;background:#12141a;color:#f8fafc;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;
+  font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.header-ram,.header-battery{display:flex;align-items:center;padding:5px 10px 5px 9px;
+  border:1px solid #343a48;border-radius:999px;background:#12141a;
+  box-shadow:inset 0 1px 0 #ffffff0a}
+.header-ram{cursor:help}
+.header-ram .ram-gauge{gap:7px;min-height:20px}
+.header-ram .ram-chip{width:30px;height:16px}
+.header-ram .ram-percent{font-size:13px}
+.header-battery .battery-gauge{gap:7px;min-height:20px}
+.header-battery .battery-icon{width:34px;height:16px;border-radius:4px}
+.header-battery .battery-icon::after{height:8px}
+.header-battery .battery-percent{font-size:13px}
+@media(max-width:640px){
+  header{padding:10px 12px;gap:8px}
+  h1{font-size:15px}
+  .header-actions{gap:5px}
+  .header-actions .btn.ghost{display:none}
+  .header-actions button{padding:7px 10px;font-size:12px}
+  .header-ram,.header-battery{padding:4px 9px 4px 8px}
+}
 main{padding:16px;max-width:1100px;margin:0 auto}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:800px){.grid{grid-template-columns:1fr}}
@@ -1808,6 +2017,42 @@ td.k{color:#9aa4b2;width:42%}
 .ok{background:#123d2b;color:#4ade80}
 .bad{background:#3d1620;color:#f87171}
 .warn{background:#3d3416;color:#fbbf24}
+.battery-gauge{display:inline-flex;align-items:center;gap:9px;min-height:26px;
+  color:#6b7280}
+.battery-icon{position:relative;display:inline-block;width:42px;height:20px;
+  padding:2px;box-sizing:border-box;border:2px solid currentColor;border-radius:5px;
+  background:#12141a}
+.battery-icon::after{content:"";position:absolute;top:50%;right:-6px;width:4px;
+  height:10px;transform:translateY(-50%);border-radius:0 2px 2px 0;
+  background:currentColor}
+.battery-fill{display:block;height:100%;border-radius:2px;background:currentColor;
+  transition:width .35s ease}
+.battery-percent{min-width:3.4ch;color:#e6e6e6;font-size:15px;font-weight:700;
+  font-variant-numeric:tabular-nums}
+.battery-good{color:#4ade80}
+.battery-medium{color:#fbbf24}
+.battery-low{color:#f87171}
+.battery-unknown{color:#6b7280}
+.ram-gauge{display:inline-flex;align-items:center;gap:9px;min-height:26px;
+  color:#6b7280}
+.ram-chip{position:relative;display:inline-block;width:38px;height:20px;padding:3px;
+  box-sizing:border-box;border:2px solid currentColor;border-radius:4px;
+  background:#12141a}
+.ram-chip::before,.ram-chip::after{content:"";position:absolute;top:2px;width:3px;
+  height:2px;background:currentColor;box-shadow:0 5px 0 currentColor,
+  0 10px 0 currentColor}
+.ram-chip::before{left:-5px}
+.ram-chip::after{right:-5px}
+.ram-fill{display:block;height:100%;border-radius:1px;background:currentColor;
+  transition:width .35s ease}
+.ram-reading{display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap}
+.ram-label{color:#a8b0c0;font-size:11px;font-weight:700;letter-spacing:.04em}
+.ram-percent{min-width:3.4ch;color:#e6e6e6;font-size:15px;font-weight:700;
+  font-variant-numeric:tabular-nums}
+.ram-good{color:#4ade80}
+.ram-medium{color:#fbbf24}
+.ram-high{color:#f87171}
+.ram-unknown{color:#6b7280}
 .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
 .dup{background:#3d1620;color:#f87171;font-weight:700}
 button,.btn{background:#2b64f5;color:#fff;border:0;padding:9px 16px;border-radius:8px;
@@ -1828,10 +2073,27 @@ button.kill{background:#7a2531;color:#f3b0b7;border:0;padding:2px 10px;
 button.kill:hover{background:#c0392b;color:#fff}
 .flash{background:#123d2b;color:#7ee2a8;border:1px solid #1c5c40;
   border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+.actionnotice{position:fixed;top:72px;right:18px;z-index:1000;max-width:min(440px,calc(100vw - 36px));
+  padding:11px 14px;border-radius:9px;border:1px solid #3158a8;background:#17233d;
+  color:#dbeafe;box-shadow:0 10px 30px #0008;font-size:13px;line-height:1.4;
+  opacity:0;transform:translateY(-8px);pointer-events:none;transition:.18s ease}
+.actionnotice.show{opacity:1;transform:translateY(0)}
+.actionnotice.ok{background:#123d2b;border-color:#1c7550;color:#9af0ba}
+.actionnotice.warn{background:#3d3416;border-color:#80691a;color:#fde68a}
+.actionnotice.bad{background:#451c25;border-color:#943443;color:#fecdd3}
+button[data-ajax-busy="1"]{opacity:.65;cursor:progress}
 .inline{display:inline;margin:0}
 .chatcard{border-color:#2b64f5;box-shadow:0 0 0 1px #2b64f533}
 .chatcard h2{color:#7ea1ff}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.targetgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;
+  margin:10px 0}
+.targetfield{display:flex;flex-direction:column;gap:4px;min-width:0}
+.targetfield label{font-size:11px;color:#a8b0c0}
+.targetfield input,.targetmode{box-sizing:border-box;width:100%;background:#12141a;
+  border:1px solid #2a2e39;color:#e6e6e6;padding:8px;border-radius:7px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(max-width:560px){.targetgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .chatlog{min-height:180px;max-height:44vh;overflow-y:auto;display:flex;
   flex-direction:column;gap:8px;padding:6px 2px;margin-bottom:10px}
 .msg.hint{background:transparent;color:#8b93a2;font-size:12px;max-width:100%;
@@ -1852,7 +2114,58 @@ button.kill:hover{background:#c0392b;color:#fff}
 # escaping; interpolated into the page template as {SCRIPTS}.
 SCRIPTS = """
 <script>
+let statusPollRunning=false;
+const armTargetSchemas={
+  JOINT:[['Joint 1','rad'],['Joint 2','rad'],['Joint 3','rad'],
+         ['Joint 4','rad'],['Joint 5','rad'],['Joint 6','rad']],
+  CARTESIAN:[['X world','m'],['Y world','m'],['Z world','m'],
+             ['Roll world','rad'],['Pitch world','rad'],['Yaw world','rad']],
+  CYLINDRICAL:[['Radius','m'],['Theta','rad'],['Z world','m'],
+               ['Roll world','rad'],['Pitch world','rad'],['Yaw world','rad']]
+};
+let armTargetCurrent={};
+let armTargetInputsDirty=false;
+function armTargetMode(){
+  return document.getElementById('arm_target_mode')?.value || 'JOINT';
+}
+function renderArmTargetCurrent(){
+  const mode=armTargetMode();
+  const key=mode.toLowerCase();
+  const values=armTargetCurrent?.[key];
+  const output=document.getElementById('arm_target_current_text');
+  if(!output) return;
+  output.textContent=Array.isArray(values) && values.length===6
+    ? values.map((value)=>Number(value).toFixed(4)).join(', ')
+    : 'feedback unavailable';
+}
+function fillArmTargetFromCurrent(){
+  const values=armTargetCurrent?.[armTargetMode().toLowerCase()];
+  if(!Array.isArray(values) || values.length!==6){
+    showActionNotice('Current target feedback is unavailable.','warn',4500);
+    return;
+  }
+  values.forEach((value,index)=>{
+    const input=document.getElementById('arm_target_v'+(index+1));
+    if(input) input.value=Number(value).toFixed(6);
+  });
+  armTargetInputsDirty=false;
+  renderArmTargetCurrent();
+}
+function updateArmTargetSchema(fillCurrent=true){
+  const schema=armTargetSchemas[armTargetMode()] || armTargetSchemas.JOINT;
+  schema.forEach((item,index)=>{
+    const label=document.getElementById('arm_target_label_'+(index+1));
+    const input=document.getElementById('arm_target_v'+(index+1));
+    if(label) label.textContent=item[0]+' ('+item[1]+')';
+    if(input) input.placeholder=item[1];
+  });
+  armTargetInputsDirty=false;
+  renderArmTargetCurrent();
+  if(fillCurrent) fillArmTargetFromCurrent();
+}
 async function pollStatus(){
+  if(statusPollRunning) return;
+  statusPollRunning=true;
   try{
     const r = await fetch('/status.json',{cache:'no-store'});
     if(!r.ok) return;
@@ -1898,6 +2211,25 @@ async function pollStatus(){
       if(searchStart) searchStart.disabled=!!d.object_search_active || !!d.object_search_busy || !!d.pickup_busy || !!d.object_tracking_active || !d.perception_active;
       if(searchStop) searchStop.disabled=!d.object_search_active || !!d.object_search_busy;
       if(searchStart) searchStart.textContent=(d.object_search_busy || d.object_search_active) ? '⏳ Searching object…' : '🔎 Start searching state';
+    }
+    if(d.arm_target_current && typeof d.arm_target_current==='object'){
+      armTargetCurrent=d.arm_target_current;
+      renderArmTargetCurrent();
+      const inputs=[1,2,3,4,5,6].map((index)=>document.getElementById('arm_target_v'+index));
+      const currentValues=armTargetCurrent?.[armTargetMode().toLowerCase()];
+      if(Array.isArray(currentValues) && currentValues.length===6
+          && !armTargetInputsDirty && inputs.some((input)=>input && input.value==='')){
+        fillArmTargetFromCurrent();
+      }
+    }
+    const armTargetSend=document.getElementById('send_arm_target_btn');
+    const targetBlocked=!d.remote_enabled || !!d.arm_target_active || !!d.pickup_busy
+      || !!d.object_tracking_active || !!d.object_tracking_busy
+      || !!d.object_search_active || !!d.object_search_busy || !!d.arm_stack_busy
+      || !['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value);
+    if(armTargetSend){
+      armTargetSend.disabled=targetBlocked;
+      armTargetSend.textContent=d.arm_target_active ? '⏳ Target running…' : '▶ Run target';
     }
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
@@ -1952,9 +2284,108 @@ async function pollStatus(){
     }
     const dot=document.getElementById('st_dot');
     if(dot){ dot.style.color='#4ade80'; setTimeout(()=>{dot.style.color='#6b7280';},400); }
+    document.querySelectorAll('button[data-ajax-busy="1"]').forEach((b)=>{b.disabled=true;});
   }catch(e){}
+  finally{ statusPollRunning=false; }
 }
 setInterval(pollStatus,1000); pollStatus();
+
+function updateHeaderClock(){
+  const clock=document.getElementById('header_clock');
+  if(!clock) return;
+  const now=new Date();
+  const pad=(value)=>String(value).padStart(2,'0');
+  clock.textContent=pad(now.getHours())+':'+pad(now.getMinutes());
+  clock.dateTime=now.toISOString();
+  try{
+    clock.title=new Intl.DateTimeFormat('en-US',{
+      dateStyle:'full',timeStyle:'medium'
+    }).format(now);
+  }catch(_error){ clock.title=now.toLocaleString(); }
+}
+setInterval(updateHeaderClock,1000); updateHeaderClock();
+
+let actionNoticeTimer=null;
+function showActionNotice(message,kind='info',holdMs=4500){
+  const notice=document.getElementById('action_notice');
+  if(!notice) return;
+  if(actionNoticeTimer) clearTimeout(actionNoticeTimer);
+  notice.textContent=message;
+  notice.className='actionnotice show '+kind;
+  notice.setAttribute('role',kind==='bad' ? 'alert' : 'status');
+  if(holdMs>0){
+    actionNoticeTimer=setTimeout(()=>{notice.classList.remove('show');},holdMs);
+  }
+}
+
+function responseMessageFromHtml(text,status){
+  try{
+    const doc=new DOMParser().parseFromString(text,'text/html');
+    const message=[doc.querySelector('h2')?.textContent,doc.querySelector('p')?.textContent]
+      .filter(Boolean).join(' — ').trim();
+    if(message) return message;
+  }catch(_error){}
+  return 'HTTP '+status;
+}
+
+function refreshStatusBurst(){
+  [0,250,750,1500,3000].forEach((delay)=>setTimeout(pollStatus,delay));
+}
+
+async function submitControlForm(form,submitter){
+  if(form.dataset.ajaxBusy==='1') return;
+  const button=submitter || form.querySelector('button[type="submit"],input[type="submit"]');
+  const originalText=button ? button.textContent : '';
+  form.dataset.ajaxBusy='1';
+  form.setAttribute('aria-busy','true');
+  if(button){
+    button.dataset.ajaxBusy='1';
+    button.disabled=true;
+    button.textContent='⏳ Processing…';
+  }
+  showActionNotice('Sending command…','info',0);
+  const body=new URLSearchParams();
+  for(const [key,value] of new FormData(form).entries()) body.append(key,String(value));
+  const action=new URL(form.action,window.location.href);
+  try{
+    const response=await fetch(action.pathname+action.search,{
+      method:'POST',
+      credentials:'same-origin',
+      cache:'no-store',
+      redirect:'follow',
+      headers:{
+        'Accept':'application/json',
+        'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8',
+        'X-Requested-With':'fetch'
+      },
+      body:body.toString()
+    });
+    const contentType=response.headers.get('content-type') || '';
+    let message='Command accepted.';
+    let actionOk=response.ok;
+    if(contentType.includes('application/json')){
+      const payload=await response.json();
+      message=payload.message || payload.error || message;
+      if(payload.ok!==undefined) actionOk=actionOk && !!payload.ok;
+    }else{
+      message=responseMessageFromHtml(await response.text(),response.status);
+    }
+    showActionNotice(message,actionOk ? 'ok' : 'bad',actionOk ? 4500 : 8000);
+  }catch(error){
+    const disruptive=action.pathname==='/restart' || action.pathname==='/shutdown';
+    showActionNotice(
+      disruptive ? 'Monitor is restarting or shutting down; waiting for the connection…' : ('Request failed: '+error),
+      disruptive ? 'warn' : 'bad',disruptive ? 8000 : 10000);
+  }finally{
+    form.dataset.ajaxBusy='0';
+    form.removeAttribute('aria-busy');
+    if(button){
+      delete button.dataset.ajaxBusy;
+      button.textContent=originalText;
+    }
+    refreshStatusBurst();
+  }
+}
 
 let liveAudioController=null;
 let liveAudioContext=null;
@@ -2071,6 +2502,15 @@ async function preloadModel(){
   if(s) setTimeout(()=>{ if(s.textContent==='✓ model ready') s.textContent=''; },2500);
 }
 document.addEventListener('DOMContentLoaded',function(){
+  document.addEventListener('submit',function(event){
+    const form=event.target;
+    if(!(form instanceof HTMLFormElement) || form.method.toLowerCase()!=='post') return;
+    // Inline safety confirmations run on the target before this bubble
+    // listener. A cancelled confirmation therefore remains cancelled.
+    if(event.defaultPrevented) return;
+    event.preventDefault();
+    submitControlForm(form,event.submitter);
+  });
   const b=document.getElementById('chatsend'); if(b) b.addEventListener('click',sendChat);
   const i=document.getElementById('chatinput');
   if(i){
@@ -2079,6 +2519,15 @@ document.addEventListener('DOMContentLoaded',function(){
   }
   const m=document.getElementById('chatmodel');
   if(m) m.addEventListener('change',preloadModel);         // and when model switches
+  const targetMode=document.getElementById('arm_target_mode');
+  if(targetMode) targetMode.addEventListener('change',()=>updateArmTargetSchema(true));
+  for(let index=1;index<=6;index++){
+    const input=document.getElementById('arm_target_v'+index);
+    if(input) input.addEventListener('input',()=>{armTargetInputsDirty=true;});
+  }
+  const useCurrent=document.getElementById('arm_target_use_current');
+  if(useCurrent) useCurrent.addEventListener('click',fillArmTargetFromCurrent);
+  updateArmTargetSchema(false);
 });
 </script>
 """
@@ -2103,13 +2552,66 @@ def gripper_pill(state: Optional[str]) -> str:
 
 
 def battery_pill(node) -> str:
+    """Render a compact live battery gauge; electrical details stay a tooltip."""
     soc = node.battery_soc
     if soc is None:
-        return '<span class="pill warn">no data</span>'
-    cls = "ok" if soc >= 40 else ("warn" if soc >= 20 else "bad")
-    volt = f" · {node.battery_v:.1f} V" if node.battery_v is not None else ""
-    amp = f" · {node.battery_a:+.1f} A" if node.battery_a is not None else ""
-    return f'<span class="pill {cls}">{soc}%{volt}{amp}</span>'
+        return (
+            '<span class="battery-gauge battery-unknown" role="img" '
+            'aria-label="Battery data unavailable" title="Battery data unavailable">'
+            '<span class="battery-icon" aria-hidden="true">'
+            '<span class="battery-fill" style="width:0%"></span></span>'
+            '<strong class="battery-percent">--%</strong></span>'
+        )
+    level = max(0, min(100, int(soc)))
+    cls = (
+        "battery-good" if level >= 40
+        else ("battery-medium" if level >= 20 else "battery-low")
+    )
+    details = [f"Battery {level}%"]
+    if node.battery_v is not None:
+        details.append(f"{node.battery_v:.1f} V")
+    if node.battery_a is not None:
+        details.append(f"{node.battery_a:+.1f} A")
+    label = html.escape(" · ".join(details), quote=True)
+    return (
+        f'<span class="battery-gauge {cls}" role="img" '
+        f'aria-label="{label}" title="{label}">'
+        '<span class="battery-icon" aria-hidden="true">'
+        f'<span class="battery-fill" style="width:{level}%"></span></span>'
+        f'<strong class="battery-percent">{level}%</strong></span>'
+    )
+
+
+def ram_gauge(info: dict) -> str:
+    """Render RAM usage as a compact memory-chip gauge for the top ribbon."""
+    raw_percent = info.get("ram_percent")
+    if raw_percent is None:
+        return (
+            '<span class="ram-gauge ram-unknown" role="img" '
+            'aria-label="RAM data unavailable" '
+            'title="RAM data unavailable">'
+            '<span class="ram-chip" aria-hidden="true">'
+            '<span class="ram-fill" style="width:0%"></span></span>'
+            '<span class="ram-reading"><span class="ram-label">RAM</span> '
+            '<strong class="ram-percent">--%</strong></span></span>'
+        )
+    level = max(0, min(100, int(raw_percent)))
+    cls = (
+        "ram-good" if level < 70
+        else ("ram-medium" if level < 85 else "ram-high")
+    )
+    details = str(info.get("ram") or f"{level}% used")
+    label = html.escape(
+        f"RAM usage {level}% · {details}", quote=True
+    )
+    return (
+        f'<span class="ram-gauge {cls}" role="img" '
+        f'aria-label="{label}" title="{label}">'
+        '<span class="ram-chip" aria-hidden="true">'
+        f'<span class="ram-fill" style="width:{level}%"></span></span>'
+        '<span class="ram-reading"><span class="ram-label">RAM</span> '
+        f'<strong class="ram-percent">{level}%</strong></span></span>'
+    )
 
 
 def status_fields(node, cam=None, audio=None) -> dict:
@@ -2125,6 +2627,16 @@ def status_fields(node, cam=None, audio=None) -> dict:
         counts[key] = counts.get(key, 0) + 1
     dups = sum(1 for c in counts.values() if c > 1)
     teleop_on = node.remote_enabled is True
+    arm_target_state = str(
+        getattr(node, "arm_target_state", "idle")
+    ).strip().lower()
+    arm_target_active = bool(getattr(node, "arm_target_active", False))
+    arm_target_class = (
+        "warn" if arm_target_active or arm_target_state in ("requesting", "stopping")
+        else "ok" if arm_target_state in ("idle", "reached", "stopped")
+        else "bad" if arm_target_state in ("rejected", "timeout", "blocked")
+        else "warn"
+    )
     running_llm = list_running_ollama()
     if running_llm:
         llm_cell = (f'<span class="pill warn">{html.escape(", ".join(running_llm))}</span>'
@@ -2216,15 +2728,17 @@ def status_fields(node, cam=None, audio=None) -> dict:
     return {
         "uptime": html.escape(info["uptime"]),
         "load": f'<span class="mono">{html.escape(info["load"])}</span>',
-        "ram": html.escape(info["ram"]),
+        "ram": ram_gauge(info),
         "temp": html.escape(info["temp"]),
         "battery": battery_pill(node),
         "arm_bus": pill(info["arm_bus"], "present", "MISSING"),
         "teleop": pill(teleop_on, "REMOTE ENABLED", "remote disabled"),
+        "remote_enabled": teleop_on,
         "control_mode": (
             f'<span class="pill ok">{html.escape(node.control_mode)}</span>'
             if node.control_mode else '<span class="pill warn">unknown</span>'
         ),
+        "control_mode_value": node.control_mode or "",
         "gripper": gripper_pill(node.gripper_state),
         "arm_stack": arm_stack,
         "perception": perception,
@@ -2239,28 +2753,40 @@ def status_fields(node, cam=None, audio=None) -> dict:
         "perception_distance": (
             f'<span class="pill ok">{node.perception_distance_m:.3f} m</span>'
             if getattr(node, "perception_distance_m", None) is not None
-            else '<span class="pill warn">belum tersedia</span>'
+            else '<span class="pill warn">unavailable</span>'
         ),
         "pickup_busy": bool(getattr(node, "pickup_busy", False)),
         "pickup_message": html.escape(
-            getattr(node, "pickup_message", "belum dijalankan")
+            getattr(node, "pickup_message", "not run yet")
         ),
         "object_tracking_active": bool(getattr(
             node, "object_tracking_active", False)),
         "object_tracking_busy": bool(getattr(
             node, "object_tracking_busy", False)),
         "object_tracking_message": html.escape(getattr(
-            node, "object_tracking_message", "belum dijalankan")),
+            node, "object_tracking_message", "not run yet")),
         "object_search_active": bool(getattr(
             node, "object_search_active", False)),
         "object_search_busy": bool(getattr(
             node, "object_search_busy", False)),
         "object_search_message": html.escape(getattr(
-            node, "object_search_message", "belum dijalankan")),
+            node, "object_search_message", "not run yet")),
+        "arm_target_active": arm_target_active,
+        "arm_target_state": (
+            f'<span class="pill {arm_target_class}">'
+            f'{html.escape(arm_target_state.upper())}</span>'
+        ),
+        "arm_target_mode": html.escape(
+            getattr(node, "arm_target_mode", "") or "—"
+        ),
+        "arm_target_message": html.escape(
+            getattr(node, "arm_target_message", "no target yet")
+        ),
+        "arm_target_current": getattr(node, "arm_target_current", {}),
         "arm_stack_busy": restart_busy,
         "arm_restart_message": (
             html.escape(restart["message"])
-            if restart["message"] else "belum ada"
+            if restart["message"] else "none yet"
         ),
         "llm": llm_cell,
         "dups": (f'<span class="pill bad">{dups} FOUND</span>' if dups
@@ -2273,11 +2799,11 @@ def status_fields(node, cam=None, audio=None) -> dict:
             getattr(node, "audio_source", "unknown")),
         "voice_active": bool(getattr(node, "voice_active", False)),
         "stt_text": html.escape(
-            getattr(node, "stt_text", "") or "Belum ada transkrip."),
+            getattr(node, "stt_text", "") or "No transcript yet."),
         "stt_status": html.escape(getattr(node, "stt_status", "offline")),
         "voice_llm_response": html.escape(
             getattr(node, "voice_llm_response", "")
-            or "Belum ada respons LLM."),
+            or "No LLM response yet."),
         "voice_llm_status": html.escape(
             getattr(node, "voice_llm_status", "offline")),
         "tts_status": html.escape(getattr(node, "tts_status", "offline")),
@@ -2311,9 +2837,7 @@ def render_page(
         ("IP addresses", f'<span class="mono">{html.escape(info["ips"])}</span>', None),
         ("Uptime", fields["uptime"], "uptime"),
         ("Load avg", fields["load"], "load"),
-        ("RAM used", fields["ram"], "ram"),
         ("CPU temp", fields["temp"], "temp"),
-        ("Battery", fields["battery"], "battery"),
         ("ROS_DOMAIN_ID", html.escape(str(info["domain_id"])), None),
         (f"Arm bus {ARM_BUS_DEVICE}", fields["arm_bus"], "arm_bus"),
         ("Teleop", fields["teleop"], "teleop"),
@@ -2346,7 +2870,7 @@ def render_page(
         )
 
     # Node/topic lists are no longer rendered — ask the Robot Agent chat instead
-    # ("listkan ros topic" / "listkan rosnode"). We still compute `dups`/`counts`
+    # ("list ROS topics" / "list ROS nodes"). We still compute `dups`/`counts`
     # above for the duplicate-node safety banner.
 
     # --- forwarded camera + teleop control ---
@@ -2386,8 +2910,8 @@ def render_page(
           else "Waiting for RealSense perception. Press Start perception."
       }</p>
       <p class="small">ROS input:
-      <span class="mono">{perception_cam_topic}</span>. Stream ini terpisah
-      dari kamera bawaan Go2W.</p>
+      <span class="mono">{perception_cam_topic}</span>. This stream is separate
+      from the Go2W built-in camera.</p>
     </div>
     """
     ddgng_cam = getattr(node, "ddgng_camera", None)
@@ -2411,8 +2935,8 @@ def render_page(
           else "Waiting for DD-GNG YOLO. Press Start DD-GNG YOLO."
       }</p>
       <p class="small">ROS input:
-      <span class="mono">{ddgng_cam_topic}</span>. DD-GNG dan perception
-      menggunakan RealSense secara bergantian.</p>
+      <span class="mono">{ddgng_cam_topic}</span>. DD-GNG and perception take
+      turns using the RealSense camera.</p>
     </div>
     """
     audio_available = bool(audio is not None and audio.available())
@@ -2435,11 +2959,11 @@ def render_page(
       <p><strong>Speech to text</strong> ·
         <span class="pill warn" id="st_stt_status">{html.escape(getattr(node, "stt_status", "offline"))}</span>
       </p>
-      <p class="mono" id="st_stt_text">{html.escape(getattr(node, "stt_text", "") or "Belum ada transkrip.")}</p>
+      <p class="mono" id="st_stt_text">{html.escape(getattr(node, "stt_text", "") or "No transcript yet.")}</p>
       <p><strong>Voice Robot Agent response</strong> ·
         <span class="pill warn" id="st_voice_llm_status">{html.escape(getattr(node, "voice_llm_status", "offline"))}</span>
       </p>
-      <p class="mono" id="st_voice_llm_response">{html.escape(getattr(node, "voice_llm_response", "") or "Belum ada respons LLM.")}</p>
+      <p class="mono" id="st_voice_llm_response">{html.escape(getattr(node, "voice_llm_response", "") or "No LLM response yet.")}</p>
       <p><strong>Natural robot voice</strong> ·
         <span class="pill warn" id="st_tts_status">{html.escape(getattr(node, "tts_status", "offline"))}</span>
         · <span id="st_tts_state">{"speaking · microphone paused" if getattr(node, "tts_speaking", False) else "listening"}</span>
@@ -2480,6 +3004,98 @@ def render_page(
     </div>
     """
 
+    initial_target_mode = (
+        node.control_mode
+        if node.control_mode in ("JOINT", "CARTESIAN", "CYLINDRICAL")
+        else "JOINT"
+    )
+    initial_target_values = getattr(node, "arm_target_current", {}).get(
+        initial_target_mode.lower(), []
+    )
+    initial_value_attrs = [
+        f' value="{float(value):.6f}"'
+        for value in initial_target_values
+    ] if len(initial_target_values) == 6 else [""] * 6
+    initial_labels = {
+        "JOINT": [
+            ("Joint 1", "rad"), ("Joint 2", "rad"),
+            ("Joint 3", "rad"), ("Joint 4", "rad"),
+            ("Joint 5", "rad"), ("Joint 6", "rad"),
+        ],
+        "CARTESIAN": [
+            ("X world", "m"), ("Y world", "m"), ("Z world", "m"),
+            ("Roll world", "rad"), ("Pitch world", "rad"),
+            ("Yaw world", "rad"),
+        ],
+        "CYLINDRICAL": [
+            ("Radius", "m"), ("Theta", "rad"), ("Z world", "m"),
+            ("Roll world", "rad"), ("Pitch world", "rad"),
+            ("Yaw world", "rad"),
+        ],
+    }[initial_target_mode]
+    target_inputs = "".join(
+        '<div class="targetfield">'
+        f'<label id="arm_target_label_{index}">{html.escape(label)} '
+        f'({html.escape(unit)})</label>'
+        f'<input id="arm_target_v{index}" name="value_{index}" '
+        f'type="number" step="any" inputmode="decimal" required'
+        f'{initial_value_attrs[index - 1]} placeholder="{html.escape(unit)}">'
+        '</div>'
+        for index, (label, unit) in enumerate(initial_labels, start=1)
+    )
+    current_target_text = (
+        ", ".join(f"{float(value):.4f}" for value in initial_target_values)
+        if len(initial_target_values) == 6 else "feedback unavailable"
+    )
+    target_send_blocked = (
+        not teleop_on
+        or fields["arm_target_active"]
+        or fields["pickup_busy"]
+        or fields["object_tracking_active"]
+        or fields["object_tracking_busy"]
+        or fields["object_search_active"]
+        or fields["object_search_busy"]
+        or fields["arm_stack_busy"]
+        or node.control_mode not in ("JOINT", "CARTESIAN", "CYLINDRICAL")
+    )
+    arm_target_html = f"""
+    <div class="card" id="arm_target_card">
+      <h2>🧭 Arm target test</h2>
+      <p>Status: <span id="st_arm_target_state">{fields["arm_target_state"]}</span>
+      · mode <span class="mono" id="st_arm_target_mode">{fields["arm_target_mode"]}</span></p>
+      <p class="mono" id="st_arm_target_message">{fields["arm_target_message"]}</p>
+      <label class="small" for="arm_target_mode">Absolute target type</label>
+      <form method="POST" action="/arm_target"
+            onsubmit="return confirm('Move the arm to this absolute target? Make sure the entire arm workspace is clear, remote arm control is enabled, and the joystick is released.')">
+        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+        <select class="targetmode" id="arm_target_mode" name="mode">
+          <option value="JOINT"{" selected" if initial_target_mode == "JOINT" else ""}>JOINT target</option>
+          <option value="CARTESIAN"{" selected" if initial_target_mode == "CARTESIAN" else ""}>CARTESIAN target</option>
+          <option value="CYLINDRICAL"{" selected" if initial_target_mode == "CYLINDRICAL" else ""}>CYLINDRICAL target</option>
+        </select>
+        <div class="targetgrid">{target_inputs}</div>
+        <div class="btnrow">
+          <button id="send_arm_target_btn" type="submit"{
+              " disabled" if target_send_blocked else ""
+          }>▶ Run target</button>
+          <button class="ghost" id="arm_target_use_current" type="button">↙ Use current position</button>
+        </div>
+      </form>
+      <form class="inline" method="POST" action="/arm_target_stop">
+        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+        <button class="stop" id="stop_arm_target_btn" type="submit">■ Stop target</button>
+      </form>
+      <p class="small">Selected-mode feedback: <span class="mono"
+      id="arm_target_current_text">{html.escape(current_target_text)}</span></p>
+      <p class="small">All targets are absolute. JOINT uses radians.
+      CARTESIAN uses XYZ in meters + RPY in radians in the world frame.
+      CYLINDRICAL uses radius in meters, theta in radians, world Z, then RPY.
+      The controller rejects targets outside workspace/joint limits,
+      unreachable IK, wrist flips, and self-collision paths. Stop target holds
+      the current joint feedback; it is not a hardware emergency stop.</p>
+    </div>
+    """
+
     restart = node.arm_restart_snapshot()
     restart_disabled = " disabled" if restart["phase"] == "restarting" else ""
     restart_label = (
@@ -2492,15 +3108,15 @@ def render_page(
       <h2>🦾 OM6DOF hardware/controller service</h2>
       <p>Status: <span id="arm_stack_card">{fields["arm_stack"]}</span></p>
       <form method="POST" action="/restart_om6dof"
-            onsubmit="return confirm('Restart seluruh OM6DOF stack? Control arm akan terputus sementara dan arm dapat bergerak saat inisialisasi.')">
+            onsubmit="return confirm('Restart the entire OM6DOF stack? Arm control will be temporarily interrupted, and the arm may move during initialization.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
         <button class="stop" id="restart_om6dof_btn" type="submit"{restart_disabled}>{restart_label}</button>
       </form>
-      <p class="small">Hasil restart terakhir:
+      <p class="small">Last restart result:
       <span id="st_arm_restart_message">{fields["arm_restart_message"]}</span></p>
-      <p class="small">Me-restart satu unit <span class="mono">{OM6DOF_SERVICE}</span>:
-      ros2_control bringup, om6dof_controller, dan teleop. Gunakan hanya ketika
-      area gerak arm aman.</p>
+      <p class="small">Restarts the single <span class="mono">{OM6DOF_SERVICE}</span>
+      unit: ros2_control bringup, om6dof_controller, and teleop. Use only when
+      the arm's motion area is clear.</p>
     </div>
     """
 
@@ -2510,22 +3126,22 @@ def render_page(
       <h2>👁️ OM6DOF perception</h2>
       <p>Status: <span id="perception_card">{fields["perception"]}</span></p>
       <p>Tracking: <span class="mono" id="st_perception_tracking">{fields["perception_tracking"]}</span></p>
-      <p>Jarak object ↔ EoE:
+      <p>Object ↔ EoE distance:
       <span id="st_perception_distance">{fields["perception_distance"]}</span></p>
       <form method="POST" action="/run_perception_pick"
-            onsubmit="return confirm('Jalankan pickup visual-servo? Arm akan tracking pan–tilt, mendekat bertahap, lock kiri–kanan, maju, lalu grasp. Pastikan area aman dan remote F3 OFF.')">
+            onsubmit="return confirm('Run visual-servo pickup? The arm will pan–tilt track, approach in stages, lock left–right, move forward, then grasp. Make sure the area is clear and remote F3 is OFF.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
         <button id="pickup_object_btn" type="submit"{
             " disabled" if fields["pickup_busy"] or fields["object_search_active"] or not perception_active else ""
         }>🤖 Pickup object</button>
       </form>
-      <p class="small">Hasil pickup:
+      <p class="small">Pickup result:
       <span id="st_pickup_message">{fields["pickup_message"]}</span></p>
       <p>Object tracking pan–tilt:
       <span class="mono" id="st_object_tracking_message">{fields["object_tracking_message"]}</span></p>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_object_tracking"
-              onsubmit="return confirm('Kamera arm akan mengikuti object kiri/kanan dan atas/bawah menggunakan joint1 + joint5. Area aman?')">
+              onsubmit="return confirm('The arm camera will follow the object left/right and up/down using joint1 + joint5. Is the area clear?')">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
           <button id="start_object_tracking_btn" type="submit"{
               " disabled" if fields["object_tracking_active"] or fields["object_tracking_busy"] or fields["object_search_active"] or not perception_active else ""
@@ -2542,7 +3158,7 @@ def render_page(
       <span class="mono" id="st_object_search_message">{fields["object_search_message"]}</span></p>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_object_search"
-              onsubmit="return confirm('Arm akan ke pose aman lalu menyapu joint1 center/kiri/kanan pada sudut rendah, sedang, dan tinggi. Pastikan area aman dan remote F3 OFF.')">
+              onsubmit="return confirm('The arm will move to a safe pose, then sweep joint1 center/left/right at low, medium, and high angles. Make sure the area is clear and remote F3 is OFF.')">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
           <button id="start_object_search_btn" type="submit"{
               " disabled" if fields["object_search_active"] or fields["object_search_busy"] or fields["pickup_busy"] or fields["object_tracking_active"] or not perception_active else ""
@@ -2572,17 +3188,16 @@ def render_page(
           <button type="submit">Set target</button>
         </div>
       </form>
-      <p class="small">Perception berjalan di robot/NX dan membuka RealSense.
-      Target harus termasuk kelas COCO yang didukung YOLOX.
-      Searching menyapu pandangan rendah → sedang → tinggi dan baru berhenti
-      sebagai FOUND setelah target terdeteksi pada 10 frame berturut-turut.
-      Pickup melakukan tracking pan–tilt sambil mendekat pada ray 3D langsung
-      menuju object (tidak dipaksa horizontal) pada jarak 16→12→8 cm,
-      mengunci ulang kiri–kanan dan atas–bawah, lalu advance dekat dan grasp.
-      Target rendah otomatis memakai upper-surface dari 3D bounding box:
-      hover di atas object lalu descend vertikal sebelum grasp.
-      Overlay hasil deteksi muncul pada kartu RealSense tersendiri tanpa
-      menggantikan kamera bawaan robot.</p>
+      <p class="small">Perception runs on the robot/NX and opens the RealSense
+      camera. The target must be a COCO class supported by YOLOX. Search sweeps
+      low → medium → high and reports FOUND only after detecting the target in
+      10 consecutive frames. Pickup uses pan–tilt tracking while approaching the
+      object directly along the 3D ray (not forced horizontal) at distances of
+      16→12→8 cm, relocks left–right and up–down, then advances at close range
+      and grasps. Low targets automatically use the upper surface of the 3D
+      bounding box: hover above the object, then descend vertically before
+      grasping. The detection overlay appears in a separate RealSense card
+      without replacing the robot's built-in camera.</p>
     </div>
     """
     ddgng_active = fields["ddgng_active"]
@@ -2600,10 +3215,10 @@ def render_page(
           <button class="stop" id="stop_ddgng_btn" type="submit"{"" if ddgng_active else " disabled"}>■ Stop DD-GNG YOLO</button>
         </form>
       </div>
-      <p class="small">Menjalankan DD-GNG + YOLO secara headless, memberi label
-      semantik pada node yang beririsan dengan deteksi, dan mengirim overlay
-      RealSense ke web. Systemd menghentikan perception/pickup ketika DD-GNG
-      dimulai agar kamera tidak dibuka oleh dua proses sekaligus.</p>
+      <p class="small">Runs DD-GNG + YOLO headlessly, assigns semantic labels
+      to nodes that intersect detections, and sends the RealSense overlay to the
+      web UI. Systemd stops perception/pickup when DD-GNG starts so two
+      processes do not open the camera at the same time.</p>
     </div>
     """
 
@@ -2657,25 +3272,30 @@ def render_page(
         node.flash = ""
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    return f"""<!doctype html><html><head><meta charset="utf-8">
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Go2W Monitor — {html.escape(info['hostname'])}</title>
 <style>{CSS}</style></head><body>
 <header><h1>🤖 Go2W Robot Monitor</h1>
-<div style="display:flex;gap:8px">
+<div class="header-actions">
+<time class="header-clock" id="header_clock" aria-label="Local time">--:--</time>
+<div class="header-ram" id="st_ram">{fields["ram"]}</div>
+<div class="header-battery" id="st_battery">{fields["battery"]}</div>
 <a class="btn ghost" href="/">↻ Refresh</a>
 <form class="inline" method="POST" action="/restart"
       onsubmit="return confirm('Restart the web monitor service? The page will reconnect in a few seconds.')">
   <button class="stop" type="submit">♻ Restart monitor</button>
 </form>
 <form class="inline" method="POST" action="/shutdown"
-      onsubmit="return confirm('Matikan web monitor? Monitor TIDAK akan hidup lagi sampai dijalankan manual (systemctl start).')">
+      onsubmit="return confirm('Shut down the web monitor? It will NOT start again until manually started with systemctl start.')">
   <button class="kill" type="submit">🛑 Kill monitor</button>
 </form>
 </div></header>
+<div id="action_notice" class="actionnotice" aria-live="polite"></div>
 <main>
-<p class="small">Battery/temperature status refreshes automatically every 3 s.
-Node &amp; topic lists are now available via chat. Snapshot {now}.</p>
+<p class="small">Status refreshes automatically every 1 s; control buttons
+run without reloading this page. Node &amp; topic lists are available via chat.
+Snapshot {now}.</p>
 {flash_html}
 {dup_banner}
 {chat_html}
@@ -2687,6 +3307,7 @@ Node &amp; topic lists are now available via chat. Snapshot {now}.</p>
     {perception_html}
     {ddgng_html}
     {teleop_html}
+    {arm_target_html}
   </div>
   <div>
     {cam_html}
@@ -2780,6 +3401,21 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
             return {k: v[0] for k, v in parse_qs(body).items()}
 
         def _redirect_home(self):
+            if self.headers.get("X-Requested-With", "").lower() == "fetch":
+                message = str(node.flash or "Request accepted.")
+                node.flash = ""
+                lowered = message.lower()
+                error_markers = (
+                    "failed", "denied", "rejected", "invalid", "unavailable",
+                    "timed out", "not ready", "disable remote",
+                    "still being processed", "already running",
+                )
+                ok = not any(marker in lowered for marker in error_markers)
+                return self._send_json({
+                    "ok": ok,
+                    "message": message,
+                    "refresh_ms": 250,
+                }, 200 if ok else 409)
             self.send_response(303)
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
@@ -2952,6 +3588,53 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                         )
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
+            if self.path in ("/arm_target", "/arm_target_stop"):
+                try:
+                    form = self._read_form()
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_html(
+                        "<h2>Request rejected</h2>"
+                        f"<p>{html.escape(str(exc))}</p>",
+                        413 if "exceeds" in str(exc) else 400,
+                    )
+                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                    node.get_logger().warn(
+                        "Rejected arm target with invalid CSRF token."
+                    )
+                    return self._send_html(
+                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
+                        403,
+                    )
+                if self.path == "/arm_target_stop":
+                    started, message = node.request_arm_target_stop()
+                else:
+                    mode = form.get("mode", "").strip().upper()
+                    try:
+                        values = [
+                            float(form[f"value_{index}"])
+                            for index in range(1, 7)
+                        ]
+                    except (KeyError, TypeError, ValueError):
+                        return self._send_html(
+                            "<h2>Invalid arm target</h2>"
+                            "<p>Enter exactly six numeric values.</p>",
+                            400,
+                        )
+                    if not all(math.isfinite(value) for value in values):
+                        return self._send_html(
+                            "<h2>Invalid arm target</h2>"
+                            "<p>All values must be finite.</p>",
+                            400,
+                        )
+                    started, message = node.request_arm_target(mode, values)
+                node.flash = message
+                if started:
+                    node.get_logger().warn(
+                        f"Arm target action requested from web: {message}"
+                    )
+                else:
+                    node.get_logger().info(message)
+                return self._redirect_home()
             if self.path in (
                 "/mode_joint", "/mode_cartesian", "/mode_cylindrical"
             ):
@@ -3060,9 +3743,8 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     "<title>Shutting down…</title>"
                     "<body style='font-family:system-ui;background:#12141a;"
                     "color:#e6e6e6;padding:40px;text-align:center'>"
-                    "<h2>🛑 Web monitor dimatikan</h2>"
-                    "<p>Monitor tidak akan hidup lagi sampai "
-                    "dijalankan manual:</p>"
+                    "<h2>🛑 Web monitor shut down</h2>"
+                    "<p>The monitor will remain off until manually started:</p>"
                     "<pre style='color:#7ea1ff'>sudo systemctl start "
                     "om6dof-web-monitor.service</pre></body>"
                 )

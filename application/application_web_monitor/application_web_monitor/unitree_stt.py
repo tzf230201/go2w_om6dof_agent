@@ -1,4 +1,4 @@
-"""Turn the filtered Unitree microphone stream into Indonesian text.
+"""Turn the filtered Unitree microphone stream into English text.
 
 The audio bridge performs Opus decoding, noise suppression, and VAD. This node
 groups the speech-only 48 kHz PCM frames into utterances, converts them to a
