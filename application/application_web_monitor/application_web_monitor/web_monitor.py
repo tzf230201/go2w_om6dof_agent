@@ -64,7 +64,11 @@ except ImportError:  # Optional on an application-only host such as the AGX.
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from unitree_go.msg import WirelessController, LowState
+try:
+    from unitree_go.msg import WirelessController, LowState
+except Exception:  # Optional when AGX runs the OM6DOF-only dashboard.
+    WirelessController = None
+    LowState = None
 from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import CompressedImage
@@ -417,6 +421,14 @@ class MonitorNode(Node):
         self.robot_ssh_host = str(
             self.get_parameter("robot_ssh_host").value
         ).strip()
+        self.declare_parameter("go2w_enabled", True)
+        requested_go2w = bool(self.get_parameter("go2w_enabled").value)
+        self.go2w_enabled = bool(
+            requested_go2w and WirelessController is not None
+        )
+        if requested_go2w and WirelessController is None:
+            self.get_logger().warn(
+                "unitree_go unavailable; falling back to OM6DOF-only mode")
         self.declare_parameter(
             "camera_topic", "/application_web_monitor/image/compressed"
         )
@@ -476,8 +488,9 @@ class MonitorNode(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self.pub_remote = self.create_publisher(
-            WirelessController, "/wirelesscontroller", qos
+        self.pub_remote = (
+            self.create_publisher(WirelessController, "/wirelesscontroller", qos)
+            if self.go2w_enabled else None
         )
         self.pub_operation_mode = self.create_publisher(
             String, "/om6dof/operation_mode", 10
@@ -519,7 +532,7 @@ class MonitorNode(Node):
         # created when unitree_api is available.
         self.pub_sport = (
             self.create_publisher(SportRequest, SPORT_TOPIC, 10)
-            if SportRequest is not None else None
+            if self.go2w_enabled and SportRequest is not None else None
         )
         # Serialise motion: one active move at a time; a new command cancels the
         # previous one. _motion_gen bumps to signal the running loop to quit.
@@ -562,13 +575,15 @@ class MonitorNode(Node):
         self.battery_soc: Optional[int] = None
         self.battery_v: Optional[float] = None
         self.battery_a: Optional[float] = None
-        self.create_subscription(LowState, "/lowstate", self._on_lowstate, qos)
-        self.create_subscription(
-            CompressedImage,
-            self.camera.topic,
-            self.camera.on_image,
-            qos,
-        )
+        if self.go2w_enabled:
+            self.create_subscription(
+                LowState, "/lowstate", self._on_lowstate, qos)
+            self.create_subscription(
+                CompressedImage,
+                self.camera.topic,
+                self.camera.on_image,
+                qos,
+            )
         self.create_subscription(
             CompressedImage,
             self.perception_camera.topic,
@@ -790,6 +805,8 @@ class MonitorNode(Node):
 
     def tap_f3(self) -> None:
         """Publish an F3 edge so ros2_control switches arm ownership."""
+        if not self.go2w_enabled or self.pub_remote is None:
+            raise RuntimeError("Go2W integration is disabled on this host")
         m = WirelessController()
         for _ in range(5):
             m.keys = BTN_F3
@@ -1077,11 +1094,14 @@ class MonitorNode(Node):
             self.pickup_message = message
 
     def arm_stack_missing_nodes(self) -> List[str]:
+        required = set(OM6DOF_REQUIRED_NODES)
+        if not getattr(self, "go2w_enabled", True):
+            required.discard("om6dof_teleop")
         try:
             names = {name for name, _namespace in self.nodes()}
         except Exception:
-            return sorted(OM6DOF_REQUIRED_NODES)
-        return sorted(OM6DOF_REQUIRED_NODES - names)
+            return sorted(required)
+        return sorted(required - names)
 
     def _poll_controller_states(self) -> None:
         if self.controller_list_client is None or ListControllers is None:
@@ -1256,7 +1276,10 @@ class MonitorNode(Node):
             message = "OM6DOF restart denied"
             if detail:
                 message += f": {detail}"
-            message += ". Install the scoped web-monitor sudoers rule."
+            message += (
+                ". Install om6dof-hardware.service locally on the AGX and "
+                "install the scoped web-monitor sudoers rule."
+            )
             self._set_arm_restart_state("failed", message)
             self.get_logger().error(message)
             return
@@ -2657,7 +2680,10 @@ def status_fields(node, cam=None, audio=None) -> dict:
         ddgng_service_status(ssh_host)
         if ssh_host else ddgng_service_status()
     )
-    missing = sorted(OM6DOF_REQUIRED_NODES - node_names)
+    required_nodes = set(OM6DOF_REQUIRED_NODES)
+    if not getattr(node, "go2w_enabled", True):
+        required_nodes.discard("om6dof_teleop")
+    missing = sorted(required_nodes - node_names)
     controller_issues = node.arm_controller_issues()
     restart = node.arm_restart_snapshot()
     restart_busy = restart["phase"] == "restarting"
@@ -2827,6 +2853,7 @@ def render_page(
         key = f"{ns.rstrip('/')}/{name}" if ns not in ("", "/") else name
         counts[key] = counts.get(key, 0) + 1
     dups = {k: c for k, c in counts.items() if c > 1}
+    go2w_enabled = bool(getattr(node, "go2w_enabled", True))
     teleop_on = node.remote_enabled is True
 
     # --- status card (dynamic cells carry id="st_*" and are live-updated by
@@ -2840,15 +2867,16 @@ def render_page(
         ("CPU temp", fields["temp"], "temp"),
         ("ROS_DOMAIN_ID", html.escape(str(info["domain_id"])), None),
         (f"Arm bus {ARM_BUS_DEVICE}", fields["arm_bus"], "arm_bus"),
-        ("Teleop", fields["teleop"], "teleop"),
         ("Arm control mode", fields["control_mode"], "control_mode"),
         ("Gripper", fields["gripper"], "gripper"),
         ("OM6DOF stack", fields["arm_stack"], "arm_stack"),
         ("OM6DOF perception", fields["perception"], "perception"),
         ("OM6DOF DD-GNG YOLO", fields["ddgng"], "ddgng"),
-        ("LLM loaded", fields["llm"], "llm"),
         ("Duplicate nodes", fields["dups"], "dups"),
     ]
+    if go2w_enabled:
+        rows.insert(7, ("Go2W teleop", fields["teleop"], "teleop"))
+        rows.insert(-1, ("LLM loaded", fields["llm"], "llm"))
     status_rows = "".join(
         f'<tr><td class="k">{k}</td>'
         + (f'<td id="st_{key}">{v}</td>' if key else f'<td>{v}</td>')
@@ -2884,7 +2912,7 @@ def render_page(
       <p class="small">ROS input: <span class="mono">{html.escape(cam.topic)}</span>.
       This monitor does not open the camera device.</p>
     </div>
-    """
+    """ if go2w_enabled else ""
     perception_cam = getattr(node, "perception_camera", None)
     perception_camera_available = bool(
         perception_cam is not None and perception_cam.available()
@@ -2972,7 +3000,7 @@ def render_page(
       This button controls playback only in this browser; speech processing on
       the AGX remains active.</p>
     </div>
-    """
+    """ if go2w_enabled else ""
     teleop_html = f"""
     <div class="card">
       <h2>🎮 Remote control</h2>
@@ -3001,6 +3029,29 @@ def render_page(
       JOINT mode; Remote OFF restores the trajectory controller for autonomous
       MoveIt execution. Select on the remote cycles JOINT → CARTESIAN →
       CYLINDRICAL.</p>
+    </div>
+    """ if go2w_enabled else f"""
+    <div class="card">
+      <h2>🦾 OM6DOF arm ownership</h2>
+      <p>Status: {pill(teleop_on, "STREAMING ENABLED", "AUTONOMOUS")}</p>
+      <div class="btnrow">
+        <form class="inline" method="POST" action="/mode_joint">
+          <button type="submit">▶ Enable JOINT control</button>
+        </form>
+        <form class="inline" method="POST" action="/mode_autonomous">
+          <button class="stop" type="submit">■ Return to AUTONOMOUS</button>
+        </form>
+      </div>
+      <div class="btnrow">
+        <form class="inline" method="POST" action="/mode_cartesian">
+          <button type="submit">CARTESIAN</button>
+        </form>
+        <form class="inline" method="POST" action="/mode_cylindrical">
+          <button type="submit">CYLINDRICAL</button>
+        </form>
+      </div>
+      <p class="small">Directly publishes the OM6DOF operation mode on the AGX.
+      No F3 event, Go2W remote, or Jetson NX connection is required.</p>
     </div>
     """
 
@@ -3115,7 +3166,7 @@ def render_page(
       <p class="small">Last restart result:
       <span id="st_arm_restart_message">{fields["arm_restart_message"]}</span></p>
       <p class="small">Restarts the single <span class="mono">{OM6DOF_SERVICE}</span>
-      unit: ros2_control bringup, om6dof_controller, and teleop. Use only when
+      unit: ros2_control bringup and om6dof_controller. Use only when
       the arm's motion area is clear.</p>
     </div>
     """
@@ -3188,7 +3239,7 @@ def render_page(
           <button type="submit">Set target</button>
         </div>
       </form>
-      <p class="small">Perception runs on the robot/NX and opens the RealSense
+      <p class="small">Perception runs locally on the AGX and opens the RealSense
       camera. The target must be a COCO class supported by YOLOX. Search sweeps
       low → medium → high and reports FOUND only after detecting the target in
       10 consecutive frames. Pickup uses pan–tilt tracking while approaching the
@@ -3263,7 +3314,7 @@ def render_page(
       <b>Kill LLM</b> frees GPU/RAM by unloading whichever model is loaded (see the
       "LLM loaded" row below). Skill: skills/go2w_control_skill.md.</p>
     </div>
-    """
+    """ if go2w_enabled else ""
 
     # one-shot flash banner (kill result etc.)
     flash_html = ""
@@ -3274,13 +3325,13 @@ def render_page(
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Go2W Monitor — {html.escape(info['hostname'])}</title>
+<title>{"Go2W + OM6DOF" if go2w_enabled else "OM6DOF"} Monitor — {html.escape(info['hostname'])}</title>
 <style>{CSS}</style></head><body>
-<header><h1>🤖 Go2W Robot Monitor</h1>
+<header><h1>{"🤖 Go2W + OM6DOF Monitor" if go2w_enabled else "🦾 OM6DOF Monitor · Go2W disabled"}</h1>
 <div class="header-actions">
 <time class="header-clock" id="header_clock" aria-label="Local time">--:--</time>
 <div class="header-ram" id="st_ram">{fields["ram"]}</div>
-<div class="header-battery" id="st_battery">{fields["battery"]}</div>
+{f'<div class="header-battery" id="st_battery">{fields["battery"]}</div>' if go2w_enabled else ''}
 <a class="btn ghost" href="/">↻ Refresh</a>
 <form class="inline" method="POST" action="/restart"
       onsubmit="return confirm('Restart the web monitor service? The page will reconnect in a few seconds.')">
@@ -3584,7 +3635,7 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     else:
                         node.flash = (
                             f"Perception {action} denied: {detail or 'unknown error'}. "
-                            "Install and start the perception user service on the robot."
+                            "Install the perception user service locally on the AGX."
                         )
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
@@ -3636,7 +3687,8 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     node.get_logger().info(message)
                 return self._redirect_home()
             if self.path in (
-                "/mode_joint", "/mode_cartesian", "/mode_cylindrical"
+                "/mode_joint", "/mode_cartesian", "/mode_cylindrical",
+                "/mode_autonomous",
             ):
                 mode = self.path.removeprefix("/mode_").upper()
                 node.set_operation_mode(mode)
@@ -3644,6 +3696,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
             if self.path in ("/start_teleop", "/stop_teleop", "/toggle_teleop"):
+                if not getattr(node, "go2w_enabled", True):
+                    return self._send_json({
+                        "ok": False,
+                        "message": "Go2W integration is disabled on this host.",
+                    }, 409)
                 want_start = self.path == "/start_teleop"
                 want_stop = self.path == "/stop_teleop"
                 running = node.teleop_running()
@@ -3690,6 +3747,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     node.get_logger().info(message)
                 return self._redirect_home()
             if self.path == "/chat":
+                if not getattr(node, "go2w_enabled", True):
+                    return self._send_json({
+                        "reply": "",
+                        "error": "Go2W Robot Agent is disabled on this host.",
+                    }, 409)
                 try:
                     length = int(self.headers.get("Content-Length", 0) or 0)
                     body = self.rfile.read(length).decode("utf-8") if length else "{}"

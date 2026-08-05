@@ -1,7 +1,7 @@
 # application_web_monitor
 
-ROS 2 application dashboard and voice-agent pipeline for the Unitree Go2W and
-OM6DOF stack. The application server runs on the Jetson AGX and provides robot
+ROS 2 application dashboard for OM6DOF, with optional Unitree Go2W integration.
+The application server runs on the Jetson AGX and provides robot
 status, forwarded camera/audio, speech-to-text, local LLM actions, teleoperation
 controls, and guarded service operations.
 
@@ -51,12 +51,21 @@ Robot Agent.
 
 ## Build and test
 
+Install the runtime dependency used to inspect ros2_control:
+
+```bash
+sudo apt update
+sudo apt install ros-humble-controller-manager-msgs
+```
+
+For the standalone AGX mode, the Unitree environment is not required:
+
 ```bash
 cd /home/kublab/ros2_ws
-source /home/kublab/unitree_ros2/setup.sh
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-select application_web_monitor
 source install/setup.bash
+unset CYCLONEDDS_URI
 
 cd src/go2w_om6dof_agent/application/application_web_monitor
 python3 -m pytest -q
@@ -66,8 +75,52 @@ Run the dashboard manually with:
 
 ```bash
 ros2 run application_web_monitor web_monitor \
-  --ros-args -p robot_ssh_host:=unitree@192.168.123.18
+  --ros-args -p go2w_enabled:=false
 ```
+
+`unset CYCLONEDDS_URI` is important when the shell previously sourced the
+Unitree setup, which pins CycloneDDS to `eno1`. Without the NX or Ethernet
+cable, that interface may be inactive and ROS will fail to create a node.
+Standalone mode lets DDS select an available AGX interface.
+
+Open `http://<agx-ip>:8080`. In this mode the header explicitly shows
+**Go2W disabled**. Go2W camera, battery, microphone, F3 teleop, TTS speaker, and
+locomotion Robot Agent controls are not created or displayed. OM6DOF hardware
+status/restart, arm ownership/modes, absolute arm targets, RealSense
+perception, and DD-GNG remain available locally on the AGX. Losing the network
+connection to the Jetson NX therefore does not stop the dashboard.
+
+Do not set `robot_ssh_host` in this topology: an empty value makes all OM6DOF
+systemd checks and controls local to the AGX.
+
+## Install as an AGX system service
+
+After building, install the supplied standalone unit and the narrowly scoped
+sudo rule used by the OM6DOF restart button:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  /home/kublab/ros2_ws/install/application_web_monitor/share/application_web_monitor/systemd/om6dof-web-monitor.service \
+  /etc/systemd/system/om6dof-web-monitor.service
+sudo install -o root -g root -m 0440 \
+  /home/kublab/ros2_ws/install/application_web_monitor/share/application_web_monitor/sudoers/om6dof-web-monitor \
+  /etc/sudoers.d/om6dof-web-monitor
+sudo visudo -cf /etc/sudoers.d/om6dof-web-monitor
+sudo systemctl daemon-reload
+sudo systemctl enable --now om6dof-web-monitor.service
+```
+
+Verify it with:
+
+```bash
+systemctl status om6dof-web-monitor.service
+journalctl -u om6dof-web-monitor.service -n 100 --no-pager
+curl -fsS http://127.0.0.1:8080/status.json
+```
+
+To restore the combined dashboard later, run with `go2w_enabled:=true`, source
+the Unitree environment, and set `robot_ssh_host` only if OM6DOF itself has
+again been moved to the remote host.
 
 ## Camera forwarding
 
@@ -99,9 +152,28 @@ ros2 launch om6dof_perception perception.launch.py
 ```
 
 The dashboard also provides an **OM6DOF perception** card. Its Start/Stop
-buttons control the user unit `om6dof-perception.service` on `robot_ssh_host`,
-and **Set target** publishes `/om6dof_perception/set_target`. Install the user
-service file shipped by `om6dof_perception` on the robot/NX first.
+buttons control the local AGX user unit `om6dof-perception.service`, and
+**Set target** publishes `/om6dof_perception/set_target`. No SSH call to the NX
+is involved.
+
+Install all optional OM6DOF application services locally for user `kublab`:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 \
+  ~/ros2_ws/install/om6dof_perception/share/om6dof_perception/systemd/om6dof-perception-user.service \
+  ~/.config/systemd/user/om6dof-perception.service
+install -m 0644 \
+  ~/ros2_ws/install/om6dof_pick_and_place/share/om6dof_pick_and_place/systemd/om6dof-perception-pick-user.service \
+  ~/.config/systemd/user/om6dof-perception-pick.service
+install -m 0644 \
+  ~/ros2_ws/install/om6dof_dd_gng/share/om6dof_dd_gng/systemd/om6dof-dd-gng.service \
+  ~/.config/systemd/user/om6dof-dd-gng.service
+systemctl --user daemon-reload
+```
+
+Perception/pick and DD-GNG conflict because both open the same RealSense. The
+GUI starts and stops these local units as mutually exclusive workloads.
 
 ## DJI microphone and audio filter
 

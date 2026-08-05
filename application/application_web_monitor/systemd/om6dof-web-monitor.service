@@ -1,5 +1,5 @@
 [Unit]
-Description=Go2W Web Monitor — LAN dashboard (status/nodes/topics/camera/teleop)
+Description=OM6DOF Web Monitor — AGX standalone LAN dashboard
 After=network-online.target multi-user.target
 Wants=network-online.target
 
@@ -8,9 +8,9 @@ Type=simple
 User=kublab
 Group=kublab
 Environment=HOME=/home/kublab
-# Use the same Unitree CycloneDDS environment and ROS domain as the hardware
-# stack, then overlay the local workspace.
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor web_monitor --ros-args -p robot_ssh_host:=unitree@192.168.123.18'
+# OM6DOF is local on the AGX. Go2W remains on the NX and is intentionally not
+# required by this service.
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor web_monitor --ros-args -p go2w_enabled:=false'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10

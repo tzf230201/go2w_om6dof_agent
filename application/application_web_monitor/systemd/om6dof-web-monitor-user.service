@@ -1,12 +1,12 @@
 [Unit]
-Description=Go2W Web Monitor — AGX application server
+Description=OM6DOF Web Monitor — AGX standalone application server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor web_monitor --ros-args -p robot_ssh_host:=unitree@192.168.123.18'
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor web_monitor --ros-args -p go2w_enabled:=false'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10
