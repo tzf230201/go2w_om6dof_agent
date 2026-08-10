@@ -10,7 +10,7 @@ Group=kublab
 Environment=HOME=/home/kublab
 # OM6DOF is local on the AGX. Go2W remains on the NX and is intentionally not
 # required by this service.
-ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor web_monitor --ros-args -p go2w_enabled:=false'
+ExecStart=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor/utility/launch_web_monitor.sh
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10

@@ -2,11 +2,14 @@
 Description=Unitree microphone decoder — AGX application server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+ConditionPathExists=/home/kublab/.config/om6dof/audio.json
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor unitree_audio_bridge'
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/unitree_ros2/cyclonedds_ws/install/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor audio_launcher'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10

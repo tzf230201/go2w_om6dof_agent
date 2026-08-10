@@ -66,10 +66,49 @@ def _bare_monitor():
     node.arm_target_goal = None
     node.arm_target_current = {}
     node.pub_arm_target = _Publisher()
+    node.pub_web_jog = _Publisher()
     node.perception_distance_m = 0.3
     node._logger = _Logger()
     node.get_logger = lambda: node._logger
     return node
+
+
+def test_joint_state_cache_keeps_finite_measured_positions_and_reports_age():
+    node = _bare_monitor()
+    node._joint_state_lock = threading.Lock()
+    node._joint_positions = {}
+    node._joint_state_updated = 0.0
+
+    node._on_joint_state(SimpleNamespace(
+        name=["joint1", "joint2", "invalid"],
+        position=[0.25, -0.5, float("nan")],
+    ))
+    snapshot = node.joint_state_snapshot()
+
+    assert snapshot["positions"] == {"joint1": 0.25, "joint2": -0.5}
+    assert snapshot["available"] is True
+    assert snapshot["age_s"] is not None
+    assert 0.0 <= snapshot["age_s"] < 1.0
+
+
+def test_web_jog_is_bounded_and_requires_matching_streaming_mode():
+    node = _bare_monitor()
+    node.remote_enabled = True
+    node.control_mode = "CARTESIAN"
+
+    accepted, message = node.request_web_jog("CARTESIAN", 0, 1.0, -0.5)
+
+    assert accepted is True
+    assert message == ""
+    assert list(node.pub_web_jog.messages[-1].data) == [
+        0.03, -0.015, 0.0, 0.0, 0.0, 0.0,
+    ]
+
+    accepted, message = node.request_web_jog("JOINT", 0, 0.0, 0.0)
+
+    assert accepted is False
+    assert "not JOINT" in message
+    assert len(node.pub_web_jog.messages) == 1
 
 
 def test_battery_gauge_unknown_state_is_visual_and_accessible():

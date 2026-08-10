@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OM6DOF MoveIt
+Comment=Check OM6DOF hardware status and run MoveIt
+Exec=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor/utility/run_moveit.sh
+Icon=applications-engineering
+Terminal=false
+Categories=Science;Robotics;
+StartupNotify=true

@@ -2,12 +2,17 @@
 Description=Kokoro natural TTS to Unitree speaker (AGX)
 After=network-online.target application-stt-llm.service
 Wants=network-online.target application-stt-llm.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+ConditionPathExists=/mnt/agx_nvme/venvs/kokoro-onnx/bin/python
+ConditionPathExists=/mnt/agx_nvme/kokoro/kokoro-v1.0.onnx
+ConditionPathExists=/mnt/agx_nvme/kokoro/voices-v1.0.bin
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/kublab/unitree_ros2/setup.sh && source /home/kublab/ros2_ws/install/setup.bash && exec /mnt/agx_nvme/venvs/kokoro-onnx/bin/python -m application_web_monitor.kokoro_tts'
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/kublab/unitree_ros2/cyclonedds_ws/install/setup.bash && source /home/kublab/ros2_ws/install/setup.bash && unset CYCLONEDDS_URI && exec /mnt/agx_nvme/venvs/kokoro-onnx/bin/python -m application_web_monitor.kokoro_tts'
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10

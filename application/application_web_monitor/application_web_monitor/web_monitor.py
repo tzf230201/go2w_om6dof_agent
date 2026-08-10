@@ -69,9 +69,17 @@ try:
 except Exception:  # Optional when AGX runs the OM6DOF-only dashboard.
     WirelessController = None
     LowState = None
-from std_msgs.msg import Bool, String, UInt8MultiArray
-from std_srvs.srv import Trigger
-from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool, Float64MultiArray, String, UInt8MultiArray
+from std_srvs.srv import SetBool, Trigger
+from sensor_msgs.msg import CompressedImage, JointState
+from tf2_msgs.msg import TFMessage
+
+from application_web_monitor.audio_control import (
+    audio_unit_states,
+    available_audio_devices,
+    control_audio_pipeline,
+    load_audio_config,
+)
 
 # unitree_api is only needed for the "Robot Agent" chat mode (direct motion
 # control). Import it softly so the dashboard still runs on machines that lack it.
@@ -429,6 +437,14 @@ class MonitorNode(Node):
         if requested_go2w and WirelessController is None:
             self.get_logger().warn(
                 "unitree_go unavailable; falling back to OM6DOF-only mode")
+        self.declare_parameter("om6dof_enabled", True)
+        self.om6dof_enabled = bool(
+            self.get_parameter("om6dof_enabled").value
+        )
+        if not self.go2w_enabled and not self.om6dof_enabled:
+            self.get_logger().warn(
+                "both robot modes were disabled; enabling OM6DOF mode")
+            self.om6dof_enabled = True
         self.declare_parameter(
             "camera_topic", "/application_web_monitor/image/compressed"
         )
@@ -483,6 +499,22 @@ class MonitorNode(Node):
         self.arm_target_message = "no target yet"
         self.arm_target_goal = None
         self.arm_target_current = {}
+        self._torque_lock = threading.Lock()
+        self.torque_busy = False
+        self.torque_state = "unknown"
+        self.torque_message = "No torque command sent yet."
+        self.rest_message = "Rest position has not been requested."
+        self._joint_state_lock = threading.Lock()
+        self._joint_positions = {}
+        self._joint_state_updated = 0.0
+        # Lightweight pose cache from robot_state_publisher.  This is the same
+        # TF source RViz and MoveIt use, but we send only the OM6DOF frames to
+        # the browser instead of meshes or a full ROS visualizer.
+        self._tf_lock = threading.Lock()
+        self._arm_tf_relative = {}
+        self._arm_tf_frames = {}
+        self._arm_tf_axes = {}
+        self._arm_tf_updated = 0.0
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -494,6 +526,12 @@ class MonitorNode(Node):
         )
         self.pub_operation_mode = self.create_publisher(
             String, "/om6dof/operation_mode", 10
+        )
+        # The web joystick is a separate, deliberately rate-limited command
+        # source.  It is only used on the standalone AGX configuration where
+        # the Go2W teleop adapter is not launched.
+        self.pub_web_jog = self.create_publisher(
+            Float64MultiArray, "/om6dof/control_cmd", 10
         )
         self.pub_arm_target = self.create_publisher(
             String, "/om6dof/target_cmd", 10
@@ -524,6 +562,9 @@ class MonitorNode(Node):
         )
         self.object_search_status_client = self.create_client(
             Trigger, "/direct_search_status"
+        )
+        self.torque_client = self.create_client(
+            SetBool, "/dynamixel_hardware_interface/set_dxl_torque"
         )
         self._object_search_status_future = None
         self.create_timer(1.0, self._poll_pickup_status)
@@ -570,6 +611,10 @@ class MonitorNode(Node):
             self._on_arm_target_status,
             grip_qos,
         )
+        self.create_subscription(
+            JointState, "/joint_states", self._on_joint_state, qos
+        )
+        self.create_subscription(TFMessage, "/tf", self._on_tf, qos)
         # Battery from /lowstate (~500 Hz). The callback only stores the latest
         # values — no processing — so it stays cheap.
         self.battery_soc: Optional[int] = None
@@ -682,6 +727,131 @@ class MonitorNode(Node):
 
     def _on_control_mode(self, msg: String) -> None:
         self.control_mode = msg.data.strip().upper()
+
+    def _on_joint_state(self, msg: JointState) -> None:
+        """Cache finite measured positions for the browser visualizer."""
+        positions = {}
+        for name, value in zip(msg.name, msg.position):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                positions[str(name)] = value
+        if not positions:
+            return
+        with self._joint_state_lock:
+            self._joint_positions = positions
+            self._joint_state_updated = time.monotonic()
+
+    def joint_state_snapshot(self) -> dict:
+        with self._joint_state_lock:
+            positions = dict(self._joint_positions)
+            updated = self._joint_state_updated
+        tf_lock = getattr(self, "_tf_lock", None)
+        if tf_lock is None:
+            frames, axes, tf_updated = {}, {}, 0.0
+        else:
+            with tf_lock:
+                frames = dict(self._arm_tf_frames)
+                axes = dict(self._arm_tf_axes)
+                tf_updated = self._arm_tf_updated
+        age = None if updated <= 0.0 else max(0.0, time.monotonic() - updated)
+        tf_age = (None if tf_updated <= 0.0 else
+                  max(0.0, time.monotonic() - tf_updated))
+        return {
+            "positions": positions,
+            "age_s": age,
+            "available": age is not None and age <= 1.0,
+            "frames": frames,
+            "tf_axes": axes,
+            "tf_age_s": tf_age,
+            "tf_available": tf_age is not None and tf_age <= 1.0,
+        }
+
+    def _on_tf(self, msg: TFMessage) -> None:
+        """Compose OM6DOF TF edges into link positions in the base frame."""
+        wanted = {
+            "link1", "link2", "link3", "link4", "link5", "link6",
+            "link7", "end_effector_link", "gripper_left_link",
+            "gripper_right_link",
+        }
+        relative = {}
+        for transform in msg.transforms:
+            name = transform.child_frame_id.lstrip("/")
+            if name not in wanted:
+                continue
+            translation = transform.transform.translation
+            rotation = transform.transform.rotation
+            values = (float(translation.x), float(translation.y),
+                      float(translation.z), float(rotation.x),
+                      float(rotation.y), float(rotation.z),
+                      float(rotation.w))
+            if all(math.isfinite(value) for value in values):
+                relative[name] = (transform.header.frame_id.lstrip("/"), values)
+        if not relative:
+            return
+        with self._tf_lock:
+            self._arm_tf_relative.update(relative)
+            edges = dict(self._arm_tf_relative)
+            poses = {"link1": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))}
+
+            def rotate(q, vector):
+                x, y, z, w = q
+                vx, vy, vz = vector
+                tx = 2.0 * (y * vz - z * vy)
+                ty = 2.0 * (z * vx - x * vz)
+                tz = 2.0 * (x * vy - y * vx)
+                return (vx + w * tx + (y * tz - z * ty),
+                        vy + w * ty + (z * tx - x * tz),
+                        vz + w * tz + (x * ty - y * tx))
+
+            def multiply(a, b):
+                ax, ay, az, aw = a
+                bx, by, bz, bw = b
+                return (aw * bx + ax * bw + ay * bz - az * by,
+                        aw * by - ax * bz + ay * bw + az * bx,
+                        aw * bz + ax * by - ay * bx + az * bw,
+                        aw * bw - ax * bx - ay * by - az * bz)
+
+            # Each /tf transform is parent-relative.  Resolve the chain just
+            # like RViz does, taking link1 as the fixed OM6DOF base frame.
+            pending = dict(edges)
+            while pending:
+                progressed = False
+                for child, (parent, values) in list(pending.items()):
+                    if parent not in poses:
+                        continue
+                    parent_p, parent_q = poses[parent]
+                    offset = rotate(parent_q, values[:3])
+                    poses[child] = (
+                        tuple(parent_p[i] + offset[i] for i in range(3)),
+                        multiply(parent_q, values[3:]),
+                    )
+                    del pending[child]
+                    progressed = True
+                if not progressed:
+                    break
+            if "link7" in poses and "end_effector_link" not in poses:
+                p, q = poses["link7"]
+                offset = rotate(q, (0.0, 0.0, 0.115))
+                poses["end_effector_link"] = (
+                    tuple(p[i] + offset[i] for i in range(3)), q)
+            self._arm_tf_frames = {
+                name: list(position) for name, (position, _rotation) in poses.items()
+                if name in wanted
+            }
+            axis_length = 0.035
+            self._arm_tf_axes = {
+                name: {
+                    "x": list(rotate(rotation, (axis_length, 0.0, 0.0))),
+                    "y": list(rotate(rotation, (0.0, axis_length, 0.0))),
+                    "z": list(rotate(rotation, (0.0, 0.0, axis_length))),
+                }
+                for name, (_position, rotation) in poses.items()
+                if name in wanted
+            }
+            self._arm_tf_updated = time.monotonic()
 
     def _on_arm_target_status(self, msg: String) -> None:
         try:
@@ -817,6 +987,123 @@ class MonitorNode(Node):
 
     def set_operation_mode(self, mode: str) -> None:
         self.pub_operation_mode.publish(String(data=mode.strip().upper()))
+
+    def request_torque(self, enable: bool) -> Tuple[bool, str]:
+        """Request a global Dynamixel torque change through the hardware owner."""
+        with self._torque_lock:
+            if self.torque_busy:
+                return False, "A torque request is already being processed."
+            if not self.torque_client.service_is_ready():
+                return False, (
+                    "Torque service unavailable. Check om6dof-hardware.service."
+                )
+            self.torque_busy = True
+            self.torque_state = "enabling" if enable else "disabling"
+            self.torque_message = (
+                "Enabling Dynamixel torque…" if enable
+                else "Disabling Dynamixel torque…"
+            )
+        future = self.torque_client.call_async(SetBool.Request(data=bool(enable)))
+        future.add_done_callback(
+            lambda completed: self._on_torque_response(completed, bool(enable))
+        )
+        return True, self.torque_message
+
+    def _on_torque_response(self, future, requested_enable: bool) -> None:
+        try:
+            response = future.result()
+            success = bool(response.success)
+            detail = str(response.message or "").strip()
+        except Exception as exc:
+            success = False
+            detail = f"Torque service failed: {exc}"
+        action = "enabled" if requested_enable else "disabled"
+        with self._torque_lock:
+            self.torque_busy = False
+            self.torque_state = action if success else "error"
+            self.torque_message = (
+                f"Torque {action}. {detail}" if success
+                else f"Failed to set torque {action}: {detail}"
+            )
+        # Keep INFO and WARN at distinct Python call sites. rclpy associates a
+        # call site with one severity and raises when a dynamically selected
+        # logger method changes that severity on a later request.
+        if requested_enable:
+            self.get_logger().info(self.torque_message)
+        else:
+            self.get_logger().warn(self.torque_message)
+
+    def request_rest_position(self) -> Tuple[bool, str]:
+        """Move to the controller's captured STARTUP pose when it is safe."""
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, (
+                    "Rest position rejected: enable streaming control first."
+                )
+            if self.control_mode not in (
+                "JOINT", "CARTESIAN", "CYLINDRICAL"
+            ):
+                return False, (
+                    "Rest position rejected: wait for READY to finish."
+                )
+            if self.arm_target_active or self.pickup_busy:
+                return False, (
+                    "Rest position rejected: an arm target or pickup is active."
+                )
+            if self.object_tracking_active or self.object_tracking_busy:
+                return False, "Rest position rejected: tracking is active."
+            if self.object_search_active or self.object_search_busy:
+                return False, "Rest position rejected: search is active."
+            if self._arm_restart_phase == "restarting":
+                return False, "Rest position rejected: the stack is restarting."
+            self.rest_message = "STARTUP/rest position requested."
+        self.set_operation_mode("STARTUP")
+        return True, self.rest_message
+
+    def request_web_jog(
+        self, mode: str, axis_pair: int, x: float, y: float
+    ) -> Tuple[bool, str]:
+        """Publish one bounded velocity sample from the browser joystick."""
+        normalized = str(mode).strip().upper()
+        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+            return False, "Joystick rejected: invalid operation mode."
+        try:
+            axis_pair = int(axis_pair)
+            x, y = float(x), float(y)
+        except (TypeError, ValueError):
+            return False, "Joystick rejected: invalid joystick value."
+        if axis_pair not in (0, 1, 2) or not all(
+            math.isfinite(value) and -1.0 <= value <= 1.0 for value in (x, y)
+        ):
+            return False, "Joystick rejected: joystick value is out of range."
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, "Joystick rejected: enable streaming control first."
+            if self.control_mode != normalized:
+                return False, (
+                    f"Joystick rejected: controller is in {self.control_mode or 'UNKNOWN'}, "
+                    f"not {normalized}."
+                )
+            if self.arm_target_active or self.pickup_busy:
+                return False, "Joystick rejected: an arm target or pickup is active."
+            if self.object_tracking_active or self.object_search_active:
+                return False, "Joystick rejected: tracking or search is active."
+            if self._arm_restart_phase == "restarting":
+                return False, "Joystick rejected: the OM6DOF stack is restarting."
+
+        # These limits are deliberately below controller.yaml maxima.
+        speed_pairs = {
+            "JOINT": ((0.25, 0.25), (0.25, 0.25), (0.25, 0.25)),
+            "CARTESIAN": ((0.03, 0.03), (0.03, 0.35), (0.35, 0.35)),
+            "CYLINDRICAL": ((0.025, 0.20), (0.025, 0.35), (0.35, 0.35)),
+        }
+        values = [0.0] * 6
+        index = axis_pair * 2
+        x_speed, y_speed = speed_pairs[normalized][axis_pair]
+        values[index] = x * x_speed
+        values[index + 1] = y * y_speed
+        self.pub_web_jog.publish(Float64MultiArray(data=values))
+        return True, ""
 
     def request_arm_target(
         self, mode: str, values: List[float]
@@ -2027,7 +2314,13 @@ h1{font-size:18px;margin:0}
 }
 main{padding:16px;max-width:1100px;margin:0 auto}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.camera-control-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(320px,.75fr);
+  gap:16px;align-items:start}
+.camera-control-grid .joystick-column{position:sticky;top:92px}
+@media(max-width:800px){
+  .grid,.camera-control-grid{grid-template-columns:1fr}
+  .camera-control-grid .joystick-column{position:static}
+}
 .card{background:#1c1f27;border:1px solid #2a2e39;border-radius:10px;padding:14px;
   margin-bottom:16px}
 .card h2{font-size:14px;margin:0 0 10px;color:#9aa4b2;text-transform:uppercase;
@@ -2130,6 +2423,30 @@ button[data-ajax-busy="1"]{opacity:.65;cursor:progress}
   color:#e6e6e6;padding:9px 11px;border-radius:8px;font-size:14px}
 .chatrow select{background:#12141a;border:1px solid #2a2e39;color:#e6e6e6;
   padding:9px;border-radius:8px;font-size:13px}
+.webjog{display:grid;grid-template-columns:minmax(190px,250px) 1fr;gap:14px;align-items:center}
+.webstick{width:190px;height:190px;max-width:100%;aspect-ratio:1;position:relative;
+  border-radius:50%;border:2px solid #3b4d71;background:radial-gradient(circle,#24314b 0 14%,#151b28 15% 100%);
+  touch-action:none;user-select:none;cursor:grab;box-shadow:inset 0 0 0 22px #0d101899}
+.webstick:active{cursor:grabbing}.webstick.disabled{opacity:.45;cursor:not-allowed}
+.webstick::before,.webstick::after{content:"";position:absolute;background:#5d6b82;opacity:.6}
+.webstick::before{width:1px;height:100%;left:50%;top:0}.webstick::after{height:1px;width:100%;top:50%;left:0}
+.webstick-knob{position:absolute;width:54px;height:54px;left:50%;top:50%;transform:translate(-50%,-50%);
+  border-radius:50%;background:#2b64f5;border:2px solid #a9c0ff;box-shadow:0 4px 16px #0009;pointer-events:none}
+.jogaxes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.jogaxes button{padding:8px;font-size:12px;background:#2a2e39}.jogaxes button.selected{background:#2b64f5}
+.jogreadout{min-height:1.3em;margin-top:8px}.jogwarning{color:#fbbf24}
+@media(max-width:560px){.webjog{grid-template-columns:1fr}.webstick{margin:auto}.jogaxes{grid-template-columns:1fr}}
+.robotviz-wrap{position:relative;height:330px;border:1px solid #2a2e39;border-radius:8px;
+  overflow:hidden;background:radial-gradient(circle at 50% 35%,#202b3d,#0d1017 72%)}
+.robotviz-wrap canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+.robotviz-wrap canvas:active{cursor:grabbing}
+.robotviz-badge{position:absolute;left:10px;top:10px;pointer-events:none}
+.robotviz-help{position:absolute;right:10px;top:10px;color:#738096;font-size:11px;
+  pointer-events:none;text-align:right}
+.robotviz-joints{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px 10px;
+  margin-top:10px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#a8b0c0}
+.robotviz-joints span{color:#e6e6e6;text-align:right;font-variant-numeric:tabular-nums}
+@media(max-width:420px){.robotviz-wrap{height:280px}.robotviz-joints{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
 
@@ -2186,6 +2503,42 @@ function updateArmTargetSchema(fillCurrent=true){
   renderArmTargetCurrent();
   if(fillCurrent) fillArmTargetFromCurrent();
 }
+
+let webJogPair=0,webJogHeld=false,webJogX=0,webJogY=0,webJogTimer=null,webJogAllowed=false;
+const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 5','Joint 6']],CARTESIAN:[['X','Y'],['Z','Roll'],['Pitch','Yaw']],CYLINDRICAL:[['Radius','Theta'],['Z','Roll'],['Pitch','Yaw']]};
+function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
+function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
+function updateWebJogAvailability(d){webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed);const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.';if(!webJogAllowed&&webJogHeld)releaseWebJog()}
+function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
+async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
+function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
+function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
+function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode');if(!stick||!mode)return;mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};stick.onpointerdown=e=>{if(!webJogAllowed)return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
+
+// Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
+// om6dof_description/urdf/om6dof.urdf.xacro; values come from measured
+// /joint_states, never from commanded targets.
+const robotViz={target:{},shown:{},frames:{},axes:{},tfAvailable:false,available:false,age:null,yaw:-.72,pitch:.34,zoom:1,
+  dragging:false,lastX:0,lastY:0,polling:false};
+const rvOrigins=[[.012,0,.017],[0,0,.0595],[0,0,.124],[0,0,.045],[0,0,.0595],[0,0,.0475]];
+const rvAxes=[[0,0,1],[0,1,0],[0,1,0],[0,0,1],[0,1,0],[0,0,1]];
+function rvMul(a,b){const r=[];for(let i=0;i<3;i++){r[i]=[];for(let j=0;j<3;j++)r[i][j]=a[i][0]*b[0][j]+a[i][1]*b[1][j]+a[i][2]*b[2][j]}return r}
+function rvVec(r,v){return [r[0][0]*v[0]+r[0][1]*v[1]+r[0][2]*v[2],r[1][0]*v[0]+r[1][1]*v[1]+r[1][2]*v[2],r[2][0]*v[0]+r[2][1]*v[1]+r[2][2]*v[2]]}
+function rvAdd(a,b){return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]}
+function rvRot(axis,q){const c=Math.cos(q),s=Math.sin(q);return axis[2]?[ [c,-s,0],[s,c,0],[0,0,1] ]:[ [c,0,s],[0,1,0],[-s,0,c] ]}
+function rvPose(){const f=robotViz.frames;if(robotViz.tfAvailable&&['link1','link2','link3','link4','link5','link6','link7','end_effector_link','gripper_left_link','gripper_right_link'].every(n=>Array.isArray(f[n]))){const wrist=f.link7,tip=f.end_effector_link,left=f.gripper_left_link,right=f.gripper_right_link,palm=[(left[0]+right[0])/2,(left[1]+right[1])/2,(left[2]+right[2])/2],la=robotViz.axes.gripper_left_link?.z,ra=robotViz.axes.gripper_right_link?.z;return {points:[f.link1,f.link2,f.link3,f.link4,f.link5,f.link6,f.link7,tip],palm,left,right,leftTip:Array.isArray(la)?rvAdd(left,la.map(v=>v*1.27)):tip,rightTip:Array.isArray(ra)?rvAdd(right,ra.map(v=>v*1.27)):tip}}let p=[0,0,0],r=[[1,0,0],[0,1,0],[0,0,1]],points=[p];for(let i=0;i<6;i++){p=rvAdd(p,rvVec(r,rvOrigins[i]));points.push(p);r=rvMul(r,rvRot(rvAxes[i],robotViz.shown['joint'+(i+1)]||0))}const wrist=p,tip=rvAdd(wrist,rvVec(r,[0,0,.115]));const grip=Math.max(-.011,Math.min(.020,robotViz.shown.gripper_left_joint||0)),palm=rvAdd(wrist,rvVec(r,[0,0,.052])),left=rvAdd(wrist,rvVec(r,[0,.021+grip,.0707])),right=rvAdd(wrist,rvVec(r,[0,-.021-grip,.0707]));return {points:[...points,tip],palm,left,right,leftTip:rvAdd(left,rvVec(r,[0,0,.0443])),rightTip:rvAdd(right,rvVec(r,[0,0,.0443]))}}
+// Mirror the display view to match the physical arm's mounting orientation.
+// This is rendering-only: ROS joint states, joystick commands, and MoveIt stay unchanged.
+function rvProject(p,w,h){const cy=Math.cos(robotViz.yaw),sy=Math.sin(robotViz.yaw),cp=Math.cos(robotViz.pitch),sp=Math.sin(robotViz.pitch);const x=sy*p[1]-cy*p[0],d=sy*p[0]+cy*p[1],v=cp*p[2]-sp*d,depth=sp*p[2]+cp*d,scale=Math.min(w*1.05,h*1.55)*robotViz.zoom;return [w*.5+x*scale,h*.88-v*scale,depth]}
+function rvArrow(c,a,b,color){const dx=b[0]-a[0],dy=b[1]-a[1],length=Math.hypot(dx,dy);if(length<2)return;const ux=dx/length,uy=dy/length;c.strokeStyle=color;c.fillStyle=color;c.lineWidth=2.5;c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(b[0],b[1]);c.stroke();c.beginPath();c.moveTo(b[0],b[1]);c.lineTo(b[0]-ux*8-uy*4,b[1]-uy*8+ux*4);c.lineTo(b[0]-ux*8+uy*4,b[1]-uy*8-ux*4);c.closePath();c.fill()}
+function drawRobotViz(){const canvas=document.getElementById('robot_visualizer');if(!canvas)return;for(const key of Object.keys(robotViz.target)){const a=robotViz.shown[key]??robotViz.target[key];robotViz.shown[key]=a+(robotViz.target[key]-a)*.22}const rect=canvas.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=rect.width,h=rect.height;if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr)}const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+  // Ground grid and world axes.
+  c.lineWidth=1;c.strokeStyle='#263044';for(let n=-3;n<=3;n++){for(const pair of [[[n*.08,-.24,0],[n*.08,.24,0]],[[-.24,n*.08,0],[.24,n*.08,0]]]){const a=rvProject(pair[0],w,h),b=rvProject(pair[1],w,h);c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(b[0],b[1]);c.stroke()}}
+  const pose=rvPose(),pts=pose.points.map(p=>rvProject(p,w,h));c.lineCap='round';c.lineJoin='round';for(let i=0;i<pts.length-1;i++){const a=pts[i],b=pts[i+1],g=c.createLinearGradient(a[0],a[1],b[0],b[1]);g.addColorStop(0,'#4d7fff');g.addColorStop(1,'#75d6ff');c.strokeStyle=g;c.lineWidth=i===pts.length-2?8:12;c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(b[0],b[1]);c.stroke()}
+  pts.slice(1,-1).forEach((p,i)=>{c.fillStyle='#101520';c.strokeStyle='#9fc3ff';c.lineWidth=3;c.beginPath();c.arc(p[0],p[1],7,0,Math.PI*2);c.fill();c.stroke();c.fillStyle='#b9c4d6';c.font='10px sans-serif';c.fillText(String(i+1),p[0]+9,p[1]-7)});
+  const wrist=pts[pts.length-2],tip=pts[pts.length-1],palm=rvProject(pose.palm,w,h),gl=rvProject(pose.left,w,h),gr=rvProject(pose.right,w,h),glt=rvProject(pose.leftTip,w,h),grt=rvProject(pose.rightTip,w,h);c.strokeStyle='#d6a34a';c.lineWidth=13;c.lineCap='round';c.beginPath();c.moveTo(wrist[0],wrist[1]);c.lineTo(palm[0],palm[1]);c.stroke();c.strokeStyle='#f4b860';c.lineWidth=9;for(const pair of [[gl,glt],[gr,grt]]){c.beginPath();c.moveTo(palm[0],palm[1]);c.lineTo(pair[0][0],pair[0][1]);c.lineTo(pair[1][0],pair[1][1]);c.stroke()}c.fillStyle='#ffe0a3';for(const g of [gl,gr]){c.beginPath();c.arc(g[0],g[1],5,0,Math.PI*2);c.fill()}if(robotViz.tfAvailable){for(const [name,axes] of Object.entries(robotViz.axes)){const origin=robotViz.frames[name];if(!Array.isArray(origin)||!axes)continue;rvArrow(c,rvProject(origin,w,h),rvProject(rvAdd(origin,axes.x||[0,0,0]),w,h),'#ef4444');rvArrow(c,rvProject(origin,w,h),rvProject(rvAdd(origin,axes.y||[0,0,0]),w,h),'#4ade80');rvArrow(c,rvProject(origin,w,h),rvProject(rvAdd(origin,axes.z||[0,0,0]),w,h),'#60a5fa');c.fillStyle='#d8dee9';c.font='10px ui-monospace,monospace';const label=rvProject(origin,w,h);c.fillText(name.replace('_link',''),label[0]+5,label[1]-5)}}c.fillStyle=robotViz.available?'#4ade80':'#f87171';c.beginPath();c.arc(tip[0],tip[1],5,0,Math.PI*2);c.fill();requestAnimationFrame(drawRobotViz)}
+async function pollRobotJoints(){if(robotViz.polling)return;robotViz.polling=true;try{const r=await fetch('/joint_state.json',{cache:'no-store'});if(!r.ok)throw new Error();const d=await r.json();robotViz.available=!!d.available;robotViz.age=d.age_s;robotViz.target=d.positions||{};robotViz.frames=d.frames||{};robotViz.axes=d.tf_axes||{};robotViz.tfAvailable=!!d.tf_available;const badge=document.getElementById('robotviz_status');if(badge){badge.textContent=robotViz.tfAvailable?'LIVE TF · '+Number(d.tf_age_s||0).toFixed(2)+' s':(d.available?'LIVE FK · '+Number(d.age_s||0).toFixed(2)+' s':(d.age_s==null?'WAITING FOR TF / /joint_states':'STALE · '+Number(d.age_s).toFixed(1)+' s'));badge.className='robotviz-badge pill '+((robotViz.tfAvailable||d.available)?'ok':'bad')}for(let i=1;i<=6;i++){const out=document.getElementById('robotviz_j'+i),v=robotViz.target['joint'+i];if(out)out.textContent=Number.isFinite(v)?(v*180/Math.PI).toFixed(1)+'°':'--'}const gout=document.getElementById('robotviz_grip'),gv=robotViz.target.gripper_left_joint;if(gout)gout.textContent=Number.isFinite(gv)?(gv*1000).toFixed(1)+' mm':'--'}catch(_e){robotViz.available=false;robotViz.tfAvailable=false}finally{robotViz.polling=false}}
+function setupRobotViz(){const canvas=document.getElementById('robot_visualizer');if(!canvas)return;canvas.onpointerdown=e=>{robotViz.dragging=true;robotViz.lastX=e.clientX;robotViz.lastY=e.clientY;canvas.setPointerCapture?.(e.pointerId)};canvas.onpointermove=e=>{if(!robotViz.dragging)return;robotViz.yaw+=(e.clientX-robotViz.lastX)*.008;robotViz.pitch=Math.max(-.25,Math.min(1.15,robotViz.pitch+(e.clientY-robotViz.lastY)*.006));robotViz.lastX=e.clientX;robotViz.lastY=e.clientY};['pointerup','pointercancel','lostpointercapture'].forEach(n=>canvas.addEventListener(n,()=>robotViz.dragging=false));canvas.onwheel=e=>{e.preventDefault();robotViz.zoom=Math.max(.6,Math.min(2.2,robotViz.zoom*Math.exp(-e.deltaY*.001))) };drawRobotViz();pollRobotJoints();setInterval(pollRobotJoints,100)}
 async function pollStatus(){
   if(statusPollRunning) return;
   statusPollRunning=true;
@@ -2200,6 +2553,12 @@ async function pollStatus(){
     if(restartButton && d.arm_stack_busy!==undefined){
       restartButton.disabled=!!d.arm_stack_busy;
       restartButton.textContent=d.arm_stack_busy ? '⏳ Restarting OM6DOF…' : '♻ Restart OM6DOF stack';
+    }
+    const enableTorque=document.getElementById('enable_torque_btn');
+    const disableTorque=document.getElementById('disable_torque_btn');
+    if(d.torque_busy!==undefined){
+      if(enableTorque) enableTorque.disabled=!!d.torque_busy;
+      if(disableTorque) disableTorque.disabled=!!d.torque_busy;
     }
     const perceptionCard=document.getElementById('perception_card');
     const startPerception=document.getElementById('start_perception_btn');
@@ -2254,6 +2613,14 @@ async function pollStatus(){
       armTargetSend.disabled=targetBlocked;
       armTargetSend.textContent=d.arm_target_active ? '⏳ Target running…' : '▶ Run target';
     }
+    const restButton=document.getElementById('rest_position_btn');
+    if(restButton){
+      restButton.disabled=!d.remote_enabled || !!d.arm_target_active || !!d.pickup_busy
+        || !!d.object_tracking_active || !!d.object_tracking_busy
+        || !!d.object_search_active || !!d.object_search_busy || !!d.arm_stack_busy
+        || !['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value);
+    }
+    updateWebJogAvailability(d);
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
     if(cameraCard && cameraImage && d.camera_available!==undefined){
@@ -2297,8 +2664,16 @@ async function pollStatus(){
     }
     const audioCard=document.getElementById('audio_card');
     if(audioCard && d.audio_available!==undefined){
-      audioCard.style.display=d.audio_available ? 'block' : 'none';
+      audioCard.style.display='block';
       if(!d.audio_available && liveAudioController) stopLiveAudio();
+      const listenButton=document.getElementById('audio_toggle');
+      if(listenButton) listenButton.disabled=!d.audio_available;
+    }
+    if(d.audio_pipeline_active!==undefined){
+      const startAudio=document.getElementById('start_audio_pipeline_btn');
+      const stopAudio=document.getElementById('stop_audio_pipeline_btn');
+      if(startAudio) startAudio.disabled=!!d.audio_pipeline_active;
+      if(stopAudio) stopAudio.disabled=!d.audio_pipeline_active;
     }
     const voiceBadge=document.getElementById('voice_badge');
     if(voiceBadge && d.voice_active!==undefined){
@@ -2312,6 +2687,7 @@ async function pollStatus(){
   finally{ statusPollRunning=false; }
 }
 setInterval(pollStatus,1000); pollStatus();
+setupRobotViz();
 
 function updateHeaderClock(){
   const clock=document.getElementById('header_clock');
@@ -2369,6 +2745,7 @@ async function submitControlForm(form,submitter){
   showActionNotice('Sending command…','info',0);
   const body=new URLSearchParams();
   for(const [key,value] of new FormData(form).entries()) body.append(key,String(value));
+  if(submitter && submitter.name) body.append(submitter.name,String(submitter.value));
   const action=new URL(form.action,window.location.href);
   try{
     const response=await fetch(action.pathname+action.search,{
@@ -2551,6 +2928,7 @@ document.addEventListener('DOMContentLoaded',function(){
   const useCurrent=document.getElementById('arm_target_use_current');
   if(useCurrent) useCurrent.addEventListener('click',fillArmTargetFromCurrent);
   updateArmTargetSchema(false);
+  setupWebJog();
 });
 </script>
 """
@@ -2751,6 +3129,10 @@ def status_fields(node, cam=None, audio=None) -> dict:
         ddgng_cam is not None and ddgng_cam.available()
     )
     audio_available = bool(audio is not None and audio.available())
+    audio_states = audio_unit_states()
+    audio_pipeline_active = any(
+        state in ("active", "activating") for state in audio_states.values()
+    )
     return {
         "uptime": html.escape(info["uptime"]),
         "load": f'<span class="mono">{html.escape(info["load"])}</span>',
@@ -2766,6 +3148,16 @@ def status_fields(node, cam=None, audio=None) -> dict:
         ),
         "control_mode_value": node.control_mode or "",
         "gripper": gripper_pill(node.gripper_state),
+        "torque_state": html.escape(
+            getattr(node, "torque_state", "unknown").upper()
+        ),
+        "torque_message": html.escape(
+            getattr(node, "torque_message", "No torque command sent yet.")
+        ),
+        "torque_busy": bool(getattr(node, "torque_busy", False)),
+        "rest_message": html.escape(getattr(
+            node, "rest_message", "Rest position has not been requested."
+        )),
         "arm_stack": arm_stack,
         "perception": perception,
         "perception_active": (
@@ -2821,6 +3213,12 @@ def status_fields(node, cam=None, audio=None) -> dict:
         "perception_camera_available": perception_camera_available,
         "ddgng_camera_available": ddgng_camera_available,
         "audio_available": audio_available,
+        "audio_pipeline_active": audio_pipeline_active,
+        "audio_pipeline": (
+            '<span class="pill ok">ON</span>'
+            if audio_pipeline_active
+            else '<span class="pill warn">OFF</span>'
+        ),
         "audio_source": html.escape(
             getattr(node, "audio_source", "unknown")),
         "voice_active": bool(getattr(node, "voice_active", False)),
@@ -2854,6 +3252,7 @@ def render_page(
         counts[key] = counts.get(key, 0) + 1
     dups = {k: c for k, c in counts.items() if c > 1}
     go2w_enabled = bool(getattr(node, "go2w_enabled", True))
+    om6dof_enabled = bool(getattr(node, "om6dof_enabled", True))
     teleop_on = node.remote_enabled is True
 
     # --- status card (dynamic cells carry id="st_*" and are live-updated by
@@ -2866,17 +3265,22 @@ def render_page(
         ("Load avg", fields["load"], "load"),
         ("CPU temp", fields["temp"], "temp"),
         ("ROS_DOMAIN_ID", html.escape(str(info["domain_id"])), None),
-        (f"Arm bus {ARM_BUS_DEVICE}", fields["arm_bus"], "arm_bus"),
-        ("Arm control mode", fields["control_mode"], "control_mode"),
-        ("Gripper", fields["gripper"], "gripper"),
-        ("OM6DOF stack", fields["arm_stack"], "arm_stack"),
-        ("OM6DOF perception", fields["perception"], "perception"),
-        ("OM6DOF DD-GNG YOLO", fields["ddgng"], "ddgng"),
-        ("Duplicate nodes", fields["dups"], "dups"),
     ]
+    if om6dof_enabled:
+        rows.extend([
+            (f"Arm bus {ARM_BUS_DEVICE}", fields["arm_bus"], "arm_bus"),
+            ("Arm control mode", fields["control_mode"], "control_mode"),
+            ("Gripper", fields["gripper"], "gripper"),
+            ("OM6DOF stack", fields["arm_stack"], "arm_stack"),
+            ("OM6DOF perception", fields["perception"], "perception"),
+            ("OM6DOF DD-GNG YOLO", fields["ddgng"], "ddgng"),
+        ])
     if go2w_enabled:
-        rows.insert(7, ("Go2W teleop", fields["teleop"], "teleop"))
-        rows.insert(-1, ("LLM loaded", fields["llm"], "llm"))
+        rows.extend([
+            ("Go2W teleop", fields["teleop"], "teleop"),
+            ("LLM loaded", fields["llm"], "llm"),
+        ])
+    rows.append(("Duplicate nodes", fields["dups"], "dups"))
     status_rows = "".join(
         f'<tr><td class="k">{k}</td>'
         + (f'<td id="st_{key}">{v}</td>' if key else f'<td>{v}</td>')
@@ -2973,9 +3377,48 @@ def render_page(
     voice_active = bool(getattr(node, "voice_active", False))
     voice_class = "ok" if voice_active else "warn"
     voice_text = "VOICE DETECTED" if voice_active else "NO VOICE DETECTED"
+    audio_devices = available_audio_devices()
+    audio_config = load_audio_config()
+    selected_input = str(audio_config.get("input", ""))
+    selected_output = str(audio_config.get("output", ""))
+
+    def audio_options(devices: list[dict], selected: str) -> str:
+        if not devices:
+            return '<option value="">No device available</option>'
+        return "".join(
+            f'<option value="{html.escape(item["id"], quote=True)}"'
+            f'{" selected" if item["id"] == selected else ""}>'
+            f'{html.escape(item["label"])}</option>'
+            for item in devices
+        )
+
+    input_options = audio_options(audio_devices["inputs"], selected_input)
+    output_options = audio_options(audio_devices["outputs"], selected_output)
+    pipeline_active = bool(fields.get("audio_pipeline_active", False))
     audio_html = f"""
-    <div class="card" id="audio_card" style="display:{audio_display}">
+    <div class="card" id="audio_card">
       <h2>🎙️ Live microphone</h2>
+      <p>Audio assistant: <span id="st_audio_pipeline">{fields["audio_pipeline"]}</span>
+      · Go2W link: {pill(audio_devices["go2w_connected"], "CONNECTED", "not connected")}</p>
+      <form method="POST" action="/audio_pipeline">
+        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+        <div class="targetgrid">
+          <div class="targetfield"><label for="audio_input_device">Microphone</label>
+            <select class="targetmode" id="audio_input_device" name="input" required>{input_options}</select>
+          </div>
+          <div class="targetfield"><label for="audio_output_device">Speaker</label>
+            <select class="targetmode" id="audio_output_device" name="output" required>{output_options}</select>
+          </div>
+        </div>
+        <div class="btnrow">
+          <button id="start_audio_pipeline_btn" name="action" value="start" type="submit"{
+              " disabled" if pipeline_active or not audio_devices["inputs"] or not audio_devices["outputs"] else ""
+          }>🎙 Enable audio</button>
+          <button class="stop" id="stop_audio_pipeline_btn" name="action" value="stop" type="submit"{
+              "" if pipeline_active else " disabled"
+          }>■ Disable audio</button>
+        </div>
+      </form>
       <p>Source: <span class="mono" id="st_audio_source">{html.escape(getattr(node, "audio_source", "unknown"))}</span></p>
       <p><span class="pill {voice_class}" id="voice_badge">{voice_text}</span></p>
       <div class="audioctl">
@@ -2997,10 +3440,36 @@ def render_page(
         · <span id="st_tts_state">{"speaking · microphone paused" if getattr(node, "tts_speaking", False) else "listening"}</span>
       </p>
       <p class="small">PCM input: <span class="mono">{audio_topic}</span>.
-      This button controls playback only in this browser; speech processing on
-      the AGX remains active.</p>
+      “Enable live audio” controls playback in this browser only. “Enable audio”
+      starts the selected microphone → STT → LLM → selected speaker pipeline.
+      Go2W devices appear only while its Ethernet link is active.</p>
     </div>
-    """ if go2w_enabled else ""
+    """
+    robot_visualizer_html = """
+    <div class="card" id="robot_visualizer_card">
+      <h2>🦾 Live OM6DOF position</h2>
+      <div class="robotviz-wrap">
+        <canvas id="robot_visualizer"
+                aria-label="Live three-dimensional OM6DOF joint visualization"></canvas>
+        <span class="robotviz-badge pill warn" id="robotviz_status">
+          WAITING FOR /joint_states
+        </span>
+        <span class="robotviz-help">drag to rotate<br>scroll to zoom</span>
+      </div>
+      <div class="robotviz-joints">
+        <div>J1 <span id="robotviz_j1">--</span></div>
+        <div>J2 <span id="robotviz_j2">--</span></div>
+        <div>J3 <span id="robotviz_j3">--</span></div>
+        <div>J4 <span id="robotviz_j4">--</span></div>
+        <div>J5 <span id="robotviz_j5">--</span></div>
+        <div>J6 <span id="robotviz_j6">--</span></div>
+        <div>Grip <span id="robotviz_grip">--</span></div>
+      </div>
+      <p class="small">Measured feedback from
+      <span class="mono">/joint_states</span>. The display turns stale when
+      hardware feedback stops.</p>
+    </div>
+    """
     teleop_html = f"""
     <div class="card">
       <h2>🎮 Remote control</h2>
@@ -3050,8 +3519,43 @@ def render_page(
           <button type="submit">CYLINDRICAL</button>
         </form>
       </div>
+      <form method="POST" action="/rest_position"
+            onsubmit="return confirm('Move the OM6DOF arm back to its captured startup/rest position? Keep the entire arm workspace clear.')">
+        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+        <button class="ghost" id="rest_position_btn" type="submit"{
+            "" if teleop_on else " disabled"
+        }>↩ Back to rest position</button>
+      </form>
+      <p class="small">Last rest request:
+      <span id="st_rest_message">{fields["rest_message"]}</span></p>
       <p class="small">Directly publishes the OM6DOF operation mode on the AGX.
       No F3 event, Go2W remote, or Jetson NX connection is required.</p>
+    </div>
+    """
+
+    web_jog_html = f"""
+    <div class="card" id="web_jog" data-csrf="{html.escape(node.csrf_token, quote=True)}">
+      <h2>🕹️ Velocity joystick</h2>
+      <div class="webjog">
+        <div class="webstick disabled" id="web_stick" role="application"
+             aria-label="Hold and drag to move the selected robot axes">
+          <div class="webstick-knob" id="web_stick_knob"></div>
+        </div>
+        <div>
+          <label class="small" for="web_jog_mode">Command mode</label>
+          <select class="targetmode" id="web_jog_mode">
+            <option value="JOINT">JOINT</option>
+            <option value="CARTESIAN">CARTESIAN</option>
+            <option value="CYLINDRICAL">CYLINDRICAL</option>
+          </select>
+          <p class="small">Choose the pair of axes controlled by the stick.</p>
+          <div class="jogaxes" id="web_jog_axes"></div>
+          <p class="mono jogreadout" id="web_jog_readout">Loading controller state…</p>
+        </div>
+      </div>
+      <p class="small jogwarning">Hold-to-move only. Release the stick to stop.
+      The dashboard sends velocity commands at 25 Hz and the controller watchdog
+      stops stale commands after 0.3 s. Keep the workspace clear.</p>
     </div>
     """
 
@@ -3158,6 +3662,25 @@ def render_page(
     <div class="card">
       <h2>🦾 OM6DOF hardware/controller service</h2>
       <p>Status: <span id="arm_stack_card">{fields["arm_stack"]}</span></p>
+      <p>Torque: <span class="mono" id="st_torque_state">{fields["torque_state"]}</span></p>
+      <div class="btnrow">
+        <form class="inline" method="POST" action="/enable_torque"
+              onsubmit="return confirm('Enable torque on all configured OM6DOF Dynamixels? Keep the full arm workspace clear.')">
+          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+          <button id="enable_torque_btn" type="submit"{
+              " disabled" if fields["torque_busy"] else ""
+          }>⚡ Enable torque</button>
+        </form>
+        <form class="inline" method="POST" action="/disable_torque"
+              onsubmit="return confirm('DISABLE TORQUE on all OM6DOF Dynamixels? The arm may fall or move under gravity. Support the arm and keep people clear.')">
+          <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+          <button class="kill" id="disable_torque_btn" type="submit"{
+              " disabled" if fields["torque_busy"] else ""
+          }>⚠ Disable torque</button>
+        </form>
+      </div>
+      <p class="small">Last torque result:
+      <span id="st_torque_message">{fields["torque_message"]}</span></p>
       <form method="POST" action="/restart_om6dof"
             onsubmit="return confirm('Restart the entire OM6DOF stack? Arm control will be temporarily interrupted, and the arm may move during initialization.')">
         <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
@@ -3323,11 +3846,16 @@ def render_page(
         node.flash = ""
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
+    monitor_label = (
+        "Go2W + OM6DOF" if go2w_enabled and om6dof_enabled
+        else "Go2W" if go2w_enabled
+        else "OM6DOF"
+    )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{"Go2W + OM6DOF" if go2w_enabled else "OM6DOF"} Monitor — {html.escape(info['hostname'])}</title>
+<title>{monitor_label} Monitor — {html.escape(info['hostname'])}</title>
 <style>{CSS}</style></head><body>
-<header><h1>{"🤖 Go2W + OM6DOF Monitor" if go2w_enabled else "🦾 OM6DOF Monitor · Go2W disabled"}</h1>
+<header><h1>{"🤖 " if go2w_enabled else "🦾 "}{monitor_label} Monitor</h1>
 <div class="header-actions">
 <time class="header-clock" id="header_clock" aria-label="Local time">--:--</time>
 <div class="header-ram" id="st_ram">{fields["ram"]}</div>
@@ -3350,20 +3878,28 @@ Snapshot {now}.</p>
 {flash_html}
 {dup_banner}
 {chat_html}
+<div class="camera-control-grid">
+  <div class="camera-column">
+    {cam_html}
+    {perception_cam_html if om6dof_enabled else ""}
+    {ddgng_cam_html if om6dof_enabled else ""}
+  </div>
+  <div class="joystick-column">
+    {web_jog_html if om6dof_enabled else ""}
+    {robot_visualizer_html if om6dof_enabled else ""}
+  </div>
+</div>
 <div class="grid">
   <div>
     <div class="card"><h2>📊 Robot status <span class="small" id="st_dot">●</span></h2>
       <table>{status_rows}</table></div>
-    {arm_service_html}
-    {perception_html}
-    {ddgng_html}
-    {teleop_html}
-    {arm_target_html}
+    {arm_service_html if om6dof_enabled else ""}
+    {perception_html if om6dof_enabled else ""}
+    {ddgng_html if om6dof_enabled else ""}
   </div>
   <div>
-    {cam_html}
-    {perception_cam_html}
-    {ddgng_cam_html}
+    {teleop_html if om6dof_enabled else ""}
+    {arm_target_html if om6dof_enabled else ""}
     {audio_html}
   </div>
 </div>
@@ -3427,6 +3963,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json(status_fields(node, cam, audio))
                 except Exception as exc:
                     return self._send_json({"error": str(exc)}, 500)
+            if self.path.startswith("/joint_state.json"):
+                try:
+                    return self._send_json(node.joint_state_snapshot())
+                except Exception as exc:
+                    return self._send_json({"error": str(exc)}, 500)
             if self.path in ("/", "/index.html"):
                 try:
                     return self._send_html(render_page(node, cam, audio))
@@ -3474,6 +4015,23 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
             self.end_headers()
 
         def do_POST(self):
+            if self.path == "/audio_pipeline":
+                try:
+                    form = self._read_form(1024)
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                    return self._send_json({
+                        "ok": False, "message": "Invalid control token."
+                    }, 403)
+                ok, message = control_audio_pipeline(
+                    form.get("action", ""),
+                    form.get("input", ""),
+                    form.get("output", ""),
+                )
+                node.flash = message
+                (node.get_logger().info if ok else node.get_logger().warn)(message)
+                return self._redirect_home()
             if self.path in ("/start_ddgng", "/stop_ddgng"):
                 try:
                     form = self._read_form()
@@ -3639,6 +4197,22 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                         )
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
+            if self.path == "/web_jog":
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({
+                            "ok": False, "message": "Invalid control token."
+                        }, 403)
+                    ok, message = node.request_web_jog(
+                        form.get("mode", ""), form.get("axis_pair", ""),
+                        form.get("x", ""), form.get("y", ""),
+                    )
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                # Keep successful 25 Hz joystick samples silent; rejected
+                # samples are surfaced to the browser but do not move the arm.
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
             if self.path in ("/arm_target", "/arm_target_stop"):
                 try:
                     form = self._read_form()
@@ -3695,6 +4269,32 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 node.flash = f"Operation mode request sent: {mode}."
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
+            if self.path == "/rest_position":
+                try:
+                    provided = self._read_form().get("csrf", "")
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_html(
+                        "<h2>Request rejected</h2>"
+                        f"<p>{html.escape(str(exc))}</p>",
+                        413 if "exceeds" in str(exc) else 400,
+                    )
+                if not csrf_token_matches(provided, node.csrf_token):
+                    node.get_logger().warn(
+                        "Rejected rest-position control with invalid CSRF token."
+                    )
+                    return self._send_html(
+                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
+                        403,
+                    )
+                started, message = node.request_rest_position()
+                node.flash = message
+                if started:
+                    node.get_logger().warn(
+                        "STARTUP/rest position requested from web monitor."
+                    )
+                else:
+                    node.get_logger().info(message)
+                return self._redirect_home()
             if self.path in ("/start_teleop", "/stop_teleop", "/toggle_teleop"):
                 if not getattr(node, "go2w_enabled", True):
                     return self._send_json({
@@ -3742,6 +4342,34 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 if started:
                     node.get_logger().warn(
                         "OM6DOF full-stack restart requested from web monitor."
+                    )
+                else:
+                    node.get_logger().info(message)
+                return self._redirect_home()
+            if self.path in ("/enable_torque", "/disable_torque"):
+                try:
+                    provided = self._read_form().get("csrf", "")
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_html(
+                        "<h2>Request rejected</h2>"
+                        f"<p>{html.escape(str(exc))}</p>",
+                        413 if "exceeds" in str(exc) else 400,
+                    )
+                if not csrf_token_matches(provided, node.csrf_token):
+                    node.get_logger().warn(
+                        "Rejected torque control with invalid CSRF token."
+                    )
+                    return self._send_html(
+                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
+                        403,
+                    )
+                enable = self.path == "/enable_torque"
+                started, message = node.request_torque(enable)
+                node.flash = message
+                if started:
+                    node.get_logger().warn(
+                        f"Torque {'enable' if enable else 'disable'} "
+                        "requested from web monitor."
                     )
                 else:
                     node.get_logger().info(message)

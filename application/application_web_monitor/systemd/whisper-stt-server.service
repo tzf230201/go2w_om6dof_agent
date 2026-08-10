@@ -2,6 +2,10 @@
 Description=whisper.cpp CUDA speech-to-text server — AGX
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+ConditionPathExists=/mnt/agx_nvme/whisper.cpp/build/bin/whisper-server
+ConditionPathExists=/mnt/agx_nvme/whisper.cpp/models/ggml-large-v3.bin
 
 [Service]
 Type=simple

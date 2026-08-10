@@ -49,6 +49,81 @@ The web microphone playback toggle only controls playback and network streaming
 to that browser. Disabling playback does not stop audio capture, STT, or the
 Robot Agent.
 
+## Desktop shortcut and monitor mode
+
+The complete desktop-shortcut implementation is stored in [`utility/`](utility):
+
+- `select_web_monitor_mode.sh` shows the OM6DOF / Go2W / combined mode picker,
+  saves the choice, restarts only the web-monitor service, and opens the local
+  dashboard in the browser.
+- `launch_web_monitor.sh` is the service entry point. It loads the Unitree ROS
+  environment only for Go2W-containing modes.
+- `OM6DOF-Web-Monitor.desktop` is the GNOME desktop shortcut.
+- `om6dof-web-monitor-launcher.sudoers` grants the shortcut permission to
+  restart only `om6dof-web-monitor.service`.
+
+To install or recreate the shortcut on the AGX after cloning or updating this
+repository:
+
+```bash
+REPO=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor
+
+chmod 0755 "$REPO/utility/launch_web_monitor.sh" \
+  "$REPO/utility/select_web_monitor_mode.sh"
+install -m 0755 "$REPO/utility/OM6DOF-Web-Monitor.desktop" \
+  "$HOME/Desktop/OM6DOF-Web-Monitor.desktop"
+gio set "$HOME/Desktop/OM6DOF-Web-Monitor.desktop" metadata::trusted true
+
+sudo install -m 0644 "$REPO/systemd/om6dof-web-monitor.service" \
+  /etc/systemd/system/om6dof-web-monitor.service
+sudo install -m 0440 "$REPO/utility/om6dof-web-monitor-launcher.sudoers" \
+  /etc/sudoers.d/om6dof-web-monitor-launcher
+sudo visudo -cf /etc/sudoers.d/om6dof-web-monitor-launcher
+sudo systemctl daemon-reload
+```
+
+Then double-click **Web Monitor Robot** on the AGX desktop and choose one mode:
+**OM6DOF only**, **Go2W only**, or **Go2W + OM6DOF**. The selected mode is
+saved in `~/.config/om6dof-web-monitor/mode.env`; the current default is
+OM6DOF. Go2W telemetry and control still require the Go2W network link to be
+present.
+
+### MoveIt desktop shortcut
+
+`utility/run_moveit.sh` and `utility/OM6DOF-MoveIt.desktop` provide a separate
+MoveIt launcher. Before opening RViz, it reports:
+
+- whether `om6dof-hardware.service` is active;
+- the reported Dynamixel torque state from
+  `/dynamixel_hardware_interface/dxl_state`;
+- whether measured `/joint_states` is inside MoveIt's `home_pose` rest area
+  (each arm joint within ±0.25 rad).
+
+The dialog offers three actions: use the current hardware stack, restart the
+stack before starting MoveIt, or stop the stack and open MoveIt in planning-only
+mode. The planning-only option starts MoveIt with `start_hardware:=false`; it
+must not be used for real robot execution.
+
+Install or recreate it with:
+
+```bash
+REPO=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor
+
+chmod 0755 "$REPO/utility/run_moveit.sh" "$REPO/utility/moveit_rest_check.py"
+install -m 0755 "$REPO/utility/OM6DOF-MoveIt.desktop" \
+  "$HOME/Desktop/OM6DOF-MoveIt.desktop"
+gio set "$HOME/Desktop/OM6DOF-MoveIt.desktop" metadata::trusted true
+
+sudo install -m 0440 "$REPO/utility/om6dof-moveit-launcher.sudoers" \
+  /etc/sudoers.d/om6dof-moveit-launcher
+sudo visudo -cf /etc/sudoers.d/om6dof-moveit-launcher
+```
+
+Use the **OM6DOF MoveIt** icon from the AGX desktop. Review the reported rest
+area and torque state before selecting a destructive stack action. The shortcut
+never launches a second OM6DOF hardware instance; MoveIt always uses
+`start_hardware:=false`.
+
 ## Build and test
 
 Install the runtime dependency used to inspect ros2_control:
@@ -93,6 +168,29 @@ connection to the Jetson NX therefore does not stop the dashboard.
 Do not set `robot_ssh_host` in this topology: an empty value makes all OM6DOF
 systemd checks and controls local to the AGX.
 
+## Live OM6DOF position visualization
+
+The dashboard includes a dependency-free 3D kinematic view next to the web
+joystick. It subscribes directly to measured `sensor_msgs/msg/JointState`
+feedback on `/joint_states`; it does not animate from commanded targets. The
+browser reads `/joint_state.json` at 10 Hz and smoothly renders joints 1–6,
+the end effector, and gripper opening. Drag the view to rotate it and use the
+mouse wheel or trackpad to zoom.
+
+The green `LIVE` badge includes the age of the latest feedback. It changes to
+`STALE` after one second without a new message, which helps distinguish a
+stopped Dynamixel/controller pipeline from a browser rendering issue. Verify
+the data source independently with:
+
+```bash
+ros2 topic hz /joint_states
+ros2 topic echo --once /joint_states
+curl -fsS http://127.0.0.1:8080/joint_state.json
+```
+
+The viewer is embedded in the monitor and does not require rosbridge, Three.js,
+a CDN, or internet access.
+
 ## Install as an AGX system service
 
 After building, install the supplied standalone unit and the narrowly scoped
@@ -109,6 +207,10 @@ sudo visudo -cf /etc/sudoers.d/om6dof-web-monitor
 sudo systemctl daemon-reload
 sudo systemctl enable --now om6dof-web-monitor.service
 ```
+
+The sudoers rule is intentionally assigned to AGX user `kublab`. If the file
+still contains the former `unitree` user, the dashboard restart button will
+fail with `sudo: a password is required`; reinstall the file after rebuilding.
 
 Verify it with:
 
@@ -383,27 +485,16 @@ systemctl --user status om6dof-web-monitor.service
 
 ## Selecting the microphone service
 
-Both source-specific unit templates are kept in `systemd/`. The installed
-generic service name is `application-audio-bridge.service` so downstream STT
-dependencies do not change.
+The dashboard audio card discovers PulseAudio microphones and speakers on the
+AGX. Go2W microphone and speaker choices appear only while the `eno1` Ethernet
+link has carrier. Select both devices and press **Enable audio** to start the
+microphone, STT, LLM, and TTS services. **Disable audio** stops them again.
 
-Use DJI:
-
-```bash
-install -m 0644 systemd/application-dji-audio-user.service \
-  ~/.config/systemd/user/application-audio-bridge.service
-systemctl --user daemon-reload
-systemctl --user restart application-audio-bridge.service application-stt.service
-```
-
-Use the Go2W built-in microphone:
-
-```bash
-install -m 0644 systemd/application-audio-bridge-user.service \
-  ~/.config/systemd/user/application-audio-bridge.service
-systemctl --user daemon-reload
-systemctl --user restart application-audio-bridge.service application-stt.service
-```
+The audio services remain disabled at login and have a systemd start limit of
+three failures per minute. A missing device, disconnected Go2W, or missing
+model therefore produces a bounded failure instead of an endless restart loop.
+The separate **Enable live audio** button controls monitoring playback only in
+the current browser.
 
 The `systemd/` directory contains the source service units. The `sudoers/`
 directory contains the narrowly scoped permission used by the guarded OM6DOF

@@ -2,11 +2,13 @@
 Description=STT to Ollama LLM bridge — AGX application server
 After=network-online.target ollama.service application-stt.service om6dof-web-monitor.service
 Wants=network-online.target ollama.service application-stt.service om6dof-web-monitor.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor stt_llm_bridge'
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/unitree_ros2/cyclonedds_ws/install/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor stt_llm_bridge'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10

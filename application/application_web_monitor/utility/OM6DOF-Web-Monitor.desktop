@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Web Monitor Robot
+Comment=Run the Go2W and OM6DOF web monitor
+Exec=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor/utility/select_web_monitor_mode.sh
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;Robotics;
+StartupNotify=true

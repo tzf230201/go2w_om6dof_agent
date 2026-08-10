@@ -2,11 +2,13 @@
 Description=Unitree microphone speech-to-text — AGX application server
 After=network-online.target whisper-stt-server.service application-audio-bridge.service
 Wants=network-online.target whisper-stt-server.service application-audio-bridge.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor unitree_stt'
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/unitree_ros2/cyclonedds_ws/install/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor unitree_stt'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10

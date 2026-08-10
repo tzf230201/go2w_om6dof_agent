@@ -2,15 +2,17 @@
 Description=DJI Wireless Mic bridge — AGX application server
 After=network-online.target pulseaudio.service pipewire.service
 Wants=network-online.target pulseaudio.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 Environment=HOME=/home/kublab
-ExecStart=/bin/bash -c 'set -e; source /home/kublab/unitree_ros2/setup.sh; source /home/kublab/ros2_ws/install/setup.bash; exec ros2 run application_web_monitor dji_audio_bridge'
+ExecStart=/bin/bash -c 'set -e; source /opt/ros/humble/setup.bash; source /home/kublab/unitree_ros2/cyclonedds_ws/install/setup.bash; source /home/kublab/ros2_ws/install/setup.bash; unset CYCLONEDDS_URI; exec ros2 run application_web_monitor dji_audio_bridge'
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10
-Restart=always
+Restart=on-failure
 RestartSec=3
 
 [Install]

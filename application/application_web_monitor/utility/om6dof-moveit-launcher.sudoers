@@ -1,0 +1,2 @@
+# Allows the MoveIt desktop launcher to restart or stop only the OM6DOF stack.
+kublab ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart om6dof-hardware.service, /usr/bin/systemctl stop om6dof-hardware.service

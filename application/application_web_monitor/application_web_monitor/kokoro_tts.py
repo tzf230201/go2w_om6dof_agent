@@ -12,8 +12,10 @@ import base64
 from collections import OrderedDict
 import io
 import json
+import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import wave
@@ -28,7 +30,13 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from std_msgs.msg import Bool, String
-from unitree_api.msg import Request, Response
+try:
+    from unitree_api.msg import Request, Response
+except Exception:  # Local PulseAudio output does not require Unitree messages.
+    Request = None
+    Response = None
+
+from application_web_monitor.audio_control import load_audio_config
 
 
 TARGET_RATE = 44100
@@ -124,6 +132,17 @@ class KokoroTts(Node):
             self.get_parameter("stream_segments").value)
         self.cache_entries = max(
             0, int(self.get_parameter("cache_entries").value))
+        selected_output = str(load_audio_config().get("output", ""))
+        if selected_output == "go2w:speaker":
+            if Request is None or Response is None:
+                raise RuntimeError("Unitree audio messages are unavailable")
+            self.output_kind = "go2w"
+            self.pulse_sink = ""
+        elif selected_output.startswith("pulse:"):
+            self.output_kind = "pulse"
+            self.pulse_sink = selected_output.removeprefix("pulse:")
+        else:
+            raise RuntimeError("No valid speaker is configured")
 
         event_qos = QoSProfile(
             depth=10,
@@ -136,16 +155,18 @@ class KokoroTts(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
-        speaker_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self.speaker_pub = self.create_publisher(
-            Request, output_topic, speaker_qos)
-        self.create_subscription(
-            Response, "/api/audiohub/response",
-            self._on_audiohub_response, speaker_qos)
+        self.speaker_pub = None
+        if self.output_kind == "go2w":
+            speaker_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.speaker_pub = self.create_publisher(
+                Request, output_topic, speaker_qos)
+            self.create_subscription(
+                Response, "/api/audiohub/response",
+                self._on_audiohub_response, speaker_qos)
         self.speaking_pub = self.create_publisher(
             Bool, speaking_topic, state_qos)
         self.status_pub = self.create_publisher(String, status_topic, state_qos)
@@ -161,8 +182,9 @@ class KokoroTts(Node):
         self.worker.start()
         self._publish_speaking(False)
         self._publish_status("ready")
+        destination = output_topic if self.output_kind == "go2w" else self.pulse_sink
         self.get_logger().info(
-            f"Kokoro {self.voice} ready: {event_topic} -> {output_topic}")
+            f"Kokoro {self.voice} ready: {event_topic} -> {destination}")
 
     def _on_response(self, message: String) -> None:
         text = normalize_tts_text(message.data)
@@ -198,8 +220,9 @@ class KokoroTts(Node):
                 speaking = True
                 time.sleep(0.10)
                 self._publish_status("speaking")
-                self._audiohub_call(ENTER_MEGAPHONE, {})
-                time.sleep(0.10)
+                if self.output_kind == "go2w":
+                    self._audiohub_call(ENTER_MEGAPHONE, {})
+                    time.sleep(0.10)
                 playback_deadline = time.monotonic()
                 for index, segment in enumerate(segments):
                     if index == 0:
@@ -209,12 +232,17 @@ class KokoroTts(Node):
                     else:
                         wav_blob, duration, cached = self._synthesize(segment)
                     upload_started = time.monotonic()
-                    self._upload_wav(wav_blob)
+                    if self.output_kind == "go2w":
+                        self._upload_wav(wav_blob)
+                    else:
+                        self._play_pulse(wav_blob)
                     uploaded = time.monotonic()
                     # Each completed WAV is queued behind audio that is still
                     # playing. Synthesis of the next segment overlaps playback.
-                    playback_deadline = max(
-                        playback_deadline, uploaded) + duration
+                    playback_deadline = (
+                        max(playback_deadline, uploaded) + duration
+                        if self.output_kind == "go2w" else uploaded
+                    )
                     if index == 0:
                         self.get_logger().info(
                             f"First TTS segment queued in "
@@ -223,8 +251,9 @@ class KokoroTts(Node):
                             f"cache={'hit' if cached else 'miss'})")
                 remaining = playback_deadline - time.monotonic()
                 time.sleep(max(0.0, remaining) + self.tail_silence)
-                self._audiohub_call(EXIT_MEGAPHONE, {})
-                time.sleep(0.20)
+                if self.output_kind == "go2w":
+                    self._audiohub_call(EXIT_MEGAPHONE, {})
+                    time.sleep(0.20)
                 self.get_logger().info(f"Spoke: {text}")
             except Exception as exc:
                 self.get_logger().error(f"TTS failed: {exc}")
@@ -267,10 +296,23 @@ class KokoroTts(Node):
             })
             time.sleep(INTER_CHUNK_DELAY)
 
+    def _play_pulse(self, wav_blob: bytes) -> None:
+        result = subprocess.run(
+            ["paplay", f"--device={self.pulse_sink}", "--raw", "--format=s16le",
+             f"--rate={TARGET_RATE}", "--channels=1"],
+            input=wav_blob[44:], capture_output=True, timeout=120.0, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"PulseAudio playback failed: {result.stderr.decode('utf-8', 'replace').strip()}"
+            )
+
     def _publish_speaking(self, speaking: bool) -> None:
         self.speaking_pub.publish(Bool(data=speaking))
 
     def _audiohub_call(self, api_id: int, parameters: dict) -> None:
+        if self.speaker_pub is None or Request is None:
+            raise RuntimeError("Go2W speaker is not configured")
         request = Request()
         request.header.identity.id = api_id
         request.header.identity.api_id = api_id
@@ -301,6 +343,13 @@ class KokoroTts(Node):
 
 
 def main(args=None) -> None:
+    selected_output = str(load_audio_config().get("output", ""))
+    if selected_output == "go2w:speaker":
+        from application_web_monitor.audio_launcher import UNITREE_DDS
+        os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+        os.environ["CYCLONEDDS_URI"] = UNITREE_DDS
+    else:
+        os.environ.pop("CYCLONEDDS_URI", None)
     rclpy.init(args=args)
     node = KokoroTts()
     try:
