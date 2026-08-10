@@ -2294,6 +2294,37 @@ header{position:sticky;top:0;z-index:900;background:#1c1f27;padding:14px 20px;
 h1{font-size:18px;margin:0}
 .header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;
   flex-wrap:wrap}
+.theme-toggle{display:inline-flex;align-items:center;gap:7px;min-height:34px;padding:3px 8px 3px 4px;
+  background:linear-gradient(145deg,#30394a,#202633);color:#eaf0ff;border:1px solid #465269;
+  border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.01em;box-shadow:0 2px 8px #0004;
+  transition:background .2s ease,border-color .2s ease,box-shadow .2s ease,transform .2s ease}
+.theme-toggle:hover{background:linear-gradient(145deg,#3a465b,#272f3f);border-color:#71809d;box-shadow:0 4px 13px #0005;transform:translateY(-1px)}
+.theme-switch-track{position:relative;display:inline-flex;align-items:center;justify-content:space-between;width:42px;height:24px;
+  padding:2px;box-sizing:border-box;border-radius:999px;background:#111722;box-shadow:inset 0 1px 3px #0009}
+.theme-switch-icon{position:relative;z-index:1;width:18px;height:18px;opacity:.45;transition:opacity .2s ease}
+.theme-moon::before{content:"";position:absolute;left:4px;top:3px;width:10px;height:10px;border-radius:50%;background:#c8d6ee;box-shadow:inset -3px -1px 0 #63728a}
+.theme-sun::before{content:"";position:absolute;left:5px;top:5px;width:8px;height:8px;border-radius:50%;background:#f7c948;box-shadow:0 -4px 0 -3px #f7c948,0 4px 0 -3px #f7c948,4px 0 0 -3px #f7c948,-4px 0 0 -3px #f7c948}
+.theme-switch-thumb{position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#9bb8ff;
+  box-shadow:0 1px 5px #0008;transition:transform .24s cubic-bezier(.2,.8,.2,1),background .2s ease}
+.theme-toggle[data-theme-mode="light"] .theme-switch-thumb{transform:translateX(18px);background:#ffd36a}
+.theme-toggle[data-theme-mode="dark"] .theme-moon,.theme-toggle[data-theme-mode="light"] .theme-sun{opacity:1}
+.theme-label{min-width:30px;text-align:left}
+:root[data-theme="light"]{color-scheme:light}
+:root[data-theme="light"] body{background:#f4f7fb;color:#182230}
+:root[data-theme="light"] header,:root[data-theme="light"] .card{background:#fff;border-color:#d9e1ec}
+:root[data-theme="light"] header{box-shadow:0 5px 18px #25344a18}
+:root[data-theme="light"] .header-clock,:root[data-theme="light"] .header-ram,:root[data-theme="light"] .header-battery,:root[data-theme="light"] .battery-icon,:root[data-theme="light"] .ram-chip,:root[data-theme="light"] .targetfield input,:root[data-theme="light"] .targetmode,:root[data-theme="light"] .chatrow input,:root[data-theme="light"] .chatrow select{background:#f7f9fc;color:#182230;border-color:#cbd5e1}
+:root[data-theme="light"] .header-clock,:root[data-theme="light"] .battery-percent,:root[data-theme="light"] .ram-percent{color:#182230}
+:root[data-theme="light"] .theme-toggle,:root[data-theme="light"] .btn.ghost,:root[data-theme="light"] .msg.ai,:root[data-theme="light"] .jogaxes button{background:#e8eef7;color:#182230}
+:root[data-theme="light"] .theme-toggle{background:linear-gradient(145deg,#fff,#e9f0f9);border-color:#c4d0df;color:#24344a;box-shadow:0 2px 8px #38506b26}
+:root[data-theme="light"] .theme-toggle:hover{background:linear-gradient(145deg,#fff,#dce8f5);border-color:#9eb1c9}
+:root[data-theme="light"] .theme-switch-track{background:#dce7f4;box-shadow:inset 0 1px 3px #7c91aa55}
+:root[data-theme="light"] .card h2,:root[data-theme="light"] td.k,:root[data-theme="light"] .ram-label,:root[data-theme="light"] .targetfield label,:root[data-theme="light"] .small,:root[data-theme="light"] .audiolevel,:root[data-theme="light"] .msg.hint{color:#536274}
+:root[data-theme="light"] td,:root[data-theme="light"] ul.nodes li{border-color:#e4eaf2}
+:root[data-theme="light"] .robotviz-wrap{border-color:#cbd5e1;background:radial-gradient(circle at 50% 35%,#edf3fb,#d7e2f0 72%)}
+:root[data-theme="light"] .webstick{border-color:#8fa3bf;background:radial-gradient(circle,#dce8f8 0 14%,#edf3fa 15% 100%);box-shadow:inset 0 0 0 22px #ffffff99}
+:root[data-theme="light"] .robotviz-joints{color:#536274}
+:root[data-theme="light"] .robotviz-joints span{color:#182230}
 .header-clock{display:inline-flex;align-items:center;min-height:26px;padding:4px 9px;
   border:1px solid #343a48;border-radius:999px;background:#12141a;color:#f8fafc;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;
@@ -2459,6 +2490,8 @@ button[data-ajax-busy="1"]{opacity:.65;cursor:progress}
 # escaping; interpolated into the page template as {SCRIPTS}.
 SCRIPTS = """
 <script>
+(function(){try{const saved=localStorage.getItem('om6dof-monitor-theme');const theme=saved==='light'||saved==='dark'?saved:(window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=theme;}catch(_e){}})();
+function setupThemeToggle(){const button=document.getElementById('theme_toggle');if(!button)return;const apply=(theme)=>{document.documentElement.dataset.theme=theme;button.dataset.themeMode=theme;const label=button.querySelector('.theme-label');if(label)label.textContent=theme==='dark'?'Dark':'Light';button.setAttribute('aria-pressed',String(theme==='light'));button.setAttribute('aria-label','Switch to '+(theme==='dark'?'light':'dark')+' mode');};apply(document.documentElement.dataset.theme==='light'?'light':'dark');button.addEventListener('click',()=>{const next=document.documentElement.dataset.theme==='light'?'dark':'light';try{localStorage.setItem('om6dof-monitor-theme',next);}catch(_e){}apply(next);});}
 let statusPollRunning=false;
 const armTargetSchemas={
   JOINT:[['Joint 1','rad'],['Joint 2','rad'],['Joint 3','rad'],
@@ -2933,6 +2966,7 @@ document.addEventListener('DOMContentLoaded',function(){
   const useCurrent=document.getElementById('arm_target_use_current');
   if(useCurrent) useCurrent.addEventListener('click',fillArmTargetFromCurrent);
   updateArmTargetSchema(false);
+  setupThemeToggle();
   setupWebJog();
 });
 </script>
@@ -3865,6 +3899,9 @@ def render_page(
 <time class="header-clock" id="header_clock" aria-label="Local time">--:--</time>
 <div class="header-ram" id="st_ram">{fields["ram"]}</div>
 {f'<div class="header-battery" id="st_battery">{fields["battery"]}</div>' if go2w_enabled else ''}
+<button class="theme-toggle" id="theme_toggle" type="button" aria-pressed="false" aria-label="Switch theme">
+  <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span><span class="theme-switch-icon theme-moon"></span><span class="theme-switch-icon theme-sun"></span></span><span class="theme-label">Dark</span>
+</button>
 <a class="btn ghost" href="/">↻ Refresh</a>
 <form class="inline" method="POST" action="/restart"
       onsubmit="return confirm('Restart the web monitor service? The page will reconnect in a few seconds.')">
