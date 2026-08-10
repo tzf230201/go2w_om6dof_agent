@@ -224,6 +224,84 @@ To restore the combined dashboard later, run with `go2w_enabled:=true`, source
 the Unitree environment, and set `robot_ssh_host` only if OM6DOF itself has
 again been moved to the remote host.
 
+## Accessing the web monitor from another computer
+
+The dashboard listens on port `8080`. A device on the same LAN can open:
+
+```text
+http://<agx-lan-ip>:8080
+```
+
+For access from a different Wi-Fi, mobile network, or another location, install
+Tailscale on the AGX and on the client computer or phone, then sign in to the
+same Tailnet. Do not expose port `8080` directly to the public internet: the
+dashboard can operate the arm and should remain private.
+
+On the AGX, verify the connection and obtain its Tailscale IP:
+
+```bash
+tailscale status
+tailscale ip -4
+```
+
+Then open the dashboard from any authorized Tailscale device:
+
+```text
+http://<agx-tailscale-ip>:8080
+```
+
+If MagicDNS is enabled, the stable hostname can be used instead:
+
+```text
+http://<agx-hostname>.<tailnet-name>.ts.net:8080
+```
+
+Example for this AGX Tailnet at the time of installation:
+
+```text
+http://agx.tail455172.ts.net:8080
+```
+
+The monitor service binds to `0.0.0.0:8080`, so no extra firewall or router
+port-forwarding rule is required for Tailscale access. Confirm the monitor is
+running before troubleshooting the client connection:
+
+```bash
+systemctl is-active om6dof-web-monitor.service
+```
+
+## Resolved issue: Perception start failed from another computer
+
+**Symptom:** Selecting **Start perception** in the web monitor showed a
+failure such as:
+
+```text
+Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined
+```
+
+**Cause:** `om6dof-web-monitor.service` is a system service. It runs as
+`kublab`, but it does not inherit the desktop session variables required by a
+plain `systemctl --user` command. The failure was independent of the browser,
+the client computer, and Tailscale.
+
+**Fix:** The web monitor service explicitly connects to the persistent
+`kublab` user manager by setting these service environment variables:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/1000
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+```
+
+It then invokes the user unit through the same user manager. This lets the
+Start/Stop Perception and DD-GNG controls work from any browser that can reach
+the monitor. User lingering must remain enabled so the user manager is
+available without an interactive desktop login:
+
+```bash
+loginctl show-user kublab -p Linger
+# Expected: Linger=yes
+```
+
 ## Camera forwarding
 
 The camera card is hidden until forwarded JPEG frames arrive on:

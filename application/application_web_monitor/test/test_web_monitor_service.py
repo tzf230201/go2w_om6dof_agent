@@ -364,8 +364,9 @@ def test_perception_status_queries_the_remote_user_service(monkeypatch):
     status = web_monitor.perception_service_status("unitree@robot")
 
     assert status["active_state"] == "inactive"
-    assert calls[0][6:10] == [
-        "/usr/bin/systemctl", "--user", "show", "om6dof-perception.service"
+    assert calls[0][6:11] == [
+        "/usr/bin/systemctl", "--machine=kublab@", "--user", "show",
+        "om6dof-perception.service",
     ]
 
 

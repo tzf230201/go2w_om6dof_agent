@@ -120,20 +120,22 @@ OM6DOF_RESTART_COMMAND = (
 )
 OM6DOF_PERCEPTION_COMMANDS = {
     "start": (
-        "/usr/bin/systemctl", "--user", "start",
+        "/usr/bin/systemctl", "--machine=kublab@", "--user", "start",
         OM6DOF_PERCEPTION_SERVICE, OM6DOF_PICK_SERVICE,
     ),
     "stop": (
-        "/usr/bin/systemctl", "--user", "stop",
+        "/usr/bin/systemctl", "--machine=kublab@", "--user", "stop",
         OM6DOF_PICK_SERVICE, OM6DOF_PERCEPTION_SERVICE,
     ),
 }
 OM6DOF_DDGNG_COMMANDS = {
     "start": (
-        "/usr/bin/systemctl", "--user", "start", OM6DOF_DDGNG_SERVICE,
+        "/usr/bin/systemctl", "--machine=kublab@", "--user", "start",
+        OM6DOF_DDGNG_SERVICE,
     ),
     "stop": (
-        "/usr/bin/systemctl", "--user", "stop", OM6DOF_DDGNG_SERVICE,
+        "/usr/bin/systemctl", "--machine=kublab@", "--user", "stop",
+        OM6DOF_DDGNG_SERVICE,
     ),
 }
 
@@ -300,7 +302,10 @@ def systemd_service_status(
     try:
         systemctl = ["/usr/bin/systemctl"]
         if user_service:
-            systemctl.append("--user")
+            # The dashboard runs as a system service, which has no desktop
+            # session bus.  Connect explicitly to kublab's lingering user
+            # manager so browser actions work from any network/client.
+            systemctl.extend(["--machine=kublab@", "--user"])
         completed = subprocess.run(
             _remote_command(ssh_host, systemctl + [
                 "show",
