@@ -2693,11 +2693,11 @@ async function pollStatus(){
       if(d.ddgng_camera_available){
         ddgngCameraImage.style.display='block';
         if(!ddgngCameraImage.getAttribute('src')) ddgngCameraImage.src='/ddgng.mjpg?'+Date.now();
-        if(ddgngCameraStatus) ddgngCameraStatus.textContent='DD-GNG YOLO semantic stream active.';
+        if(ddgngCameraStatus) ddgngCameraStatus.textContent='DD-GNG 3D segmentation stream active.';
       }else{
         ddgngCameraImage.style.display='none';
         ddgngCameraImage.removeAttribute('src');
-        if(ddgngCameraStatus) ddgngCameraStatus.textContent='Waiting for DD-GNG YOLO. Press Start DD-GNG YOLO.';
+        if(ddgngCameraStatus) ddgngCameraStatus.textContent='Waiting for DD-GNG 3D segmentation. Press Start 3D segmentation.';
       }
     }
     const audioCard=document.getElementById('audio_card');
@@ -3312,7 +3312,7 @@ def render_page(
             ("Gripper", fields["gripper"], "gripper"),
             ("OM6DOF stack", fields["arm_stack"], "arm_stack"),
             ("OM6DOF perception", fields["perception"], "perception"),
-            ("OM6DOF DD-GNG YOLO", fields["ddgng"], "ddgng"),
+            ("OM6DOF DD-GNG 3D segmentation", fields["ddgng"], "ddgng"),
         ])
     if go2w_enabled:
         rows.extend([
@@ -3396,14 +3396,14 @@ def render_page(
     )
     ddgng_cam_html = f"""
     <div class="card" id="ddgng_camera_card">
-      <h2>🕸️ OM6DOF DD-GNG YOLO preview</h2>
+      <h2>🕸️ OM6DOF DD-GNG 3D segmentation preview</h2>
       <img class="cam" id="ddgng_camera_image"{ddgng_cam_src}
            style="display:{ddgng_img_display}"
            alt="OM6DOF DD-GNG RealSense stream">
       <p id="ddgng_camera_status">{
-          "DD-GNG YOLO semantic stream active."
+          "DD-GNG 3D segmentation stream active."
           if ddgng_camera_available
-          else "Waiting for DD-GNG YOLO. Press Start DD-GNG YOLO."
+          else "Waiting for DD-GNG 3D segmentation. Press Start 3D segmentation."
       }</p>
       <p class="small">ROS input:
       <span class="mono">{ddgng_cam_topic}</span>. DD-GNG and perception take
@@ -3816,22 +3816,23 @@ def render_page(
     ddgng_active = fields["ddgng_active"]
     ddgng_html = f"""
     <div class="card">
-      <h2>🕸️ OM6DOF DD-GNG YOLO</h2>
+      <h2>🕸️ OM6DOF DD-GNG 3D segmentation</h2>
       <p>Status: <span id="ddgng_card">{fields["ddgng"]}</span></p>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_ddgng">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button id="start_ddgng_btn" type="submit"{" disabled" if ddgng_active else ""}>▶ Start DD-GNG YOLO</button>
+          <button id="start_ddgng_btn" type="submit"{" disabled" if ddgng_active else ""}>▶ Start 3D segmentation</button>
         </form>
         <form class="inline" method="POST" action="/stop_ddgng">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button class="stop" id="stop_ddgng_btn" type="submit"{"" if ddgng_active else " disabled"}>■ Stop DD-GNG YOLO</button>
+          <button class="stop" id="stop_ddgng_btn" type="submit"{"" if ddgng_active else " disabled"}>■ Stop 3D segmentation</button>
         </form>
       </div>
-      <p class="small">Runs DD-GNG + YOLO headlessly, assigns semantic labels
-      to nodes that intersect detections, and sends the RealSense overlay to the
-      web UI. Systemd stops perception/pickup when DD-GNG starts so two
-      processes do not open the camera at the same time.</p>
+      <p class="small">Runs DD-GNG with YOLO object names and RealSense depth
+      segmentation. Each detection becomes a camera-frame 3D bounding box; only
+      DD-GNG nodes inside that box receive the object label. The overlay shows
+      box size and distance. Systemd stops perception/pickup when this starts
+      so two processes do not open the camera at the same time.</p>
     </div>
     """
 
