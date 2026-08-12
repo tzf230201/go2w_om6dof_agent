@@ -610,3 +610,25 @@ the current browser.
 The `systemd/` directory contains the source service units. The `sudoers/`
 directory contains the narrowly scoped permission used by the guarded OM6DOF
 restart button.
+
+## RealSense low-light mode
+
+The dashboard has a **RealSense low-light mode** card. Enable it before starting
+Perception or DD-GNG to request the connected camera's low-light setting. On a
+camera with an IR emitter, it enables the emitter and applies the configured
+laser power. On the installed D405, which exposes no controllable IR emitter or
+laser-power option, it enables auto exposure instead. If a camera workload is
+already active, the dashboard restarts only that workload so the setting takes
+effect; it does not touch the arm stack.
+
+The shared setting is stored on the AGX at:
+
+```text
+~/.config/om6dof-realsense/low_light.json
+```
+
+The default laser power is `150`. It is safely clamped to the range reported by
+a device that supports it. Low-light mode does not make YOLO RGB labels see in
+the dark:
+YOLOX still needs visible light to identify object names. Use a small white LED
+when semantic labels are needed in darkness.

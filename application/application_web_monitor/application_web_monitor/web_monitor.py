@@ -95,6 +95,14 @@ OM6DOF_SERVICE = "om6dof-hardware.service"
 OM6DOF_PERCEPTION_SERVICE = "om6dof-perception.service"
 OM6DOF_PICK_SERVICE = "om6dof-perception-pick.service"
 OM6DOF_DDGNG_SERVICE = "om6dof-dd-gng.service"
+LOW_LIGHT_CONFIG_PATH = os.path.expanduser(
+    "~/.config/om6dof-realsense/low_light.json"
+)
+LOW_LIGHT_DEFAULT = {
+    "enabled": False,
+    "laser_power": 150.0,
+    "brightness_threshold": 45.0,
+}
 PICKUP_STATUS_TIMEOUT_S = 3.0
 OM6DOF_REQUIRED_NODES = frozenset({
     "controller_manager",
@@ -138,6 +146,37 @@ OM6DOF_DDGNG_COMMANDS = {
         OM6DOF_DDGNG_SERVICE,
     ),
 }
+
+
+def load_low_light_config(path: str = LOW_LIGHT_CONFIG_PATH) -> dict:
+    """Load a safe, user-owned setting shared by RealSense workloads."""
+    config = dict(LOW_LIGHT_DEFAULT)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            supplied = json.load(handle)
+        if isinstance(supplied, dict):
+            config["enabled"] = bool(supplied.get("enabled", config["enabled"]))
+            config["laser_power"] = float(supplied.get("laser_power", config["laser_power"]))
+            config["brightness_threshold"] = float(supplied.get("brightness_threshold", config["brightness_threshold"]))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    config["laser_power"] = max(0.0, min(360.0, config["laser_power"]))
+    config["brightness_threshold"] = max(0.0, min(255.0, config["brightness_threshold"]))
+    return config
+
+
+def save_low_light_config(enabled: bool, path: str = LOW_LIGHT_CONFIG_PATH) -> dict:
+    """Persist the toggle without accepting arbitrary values from HTTP."""
+    config = load_low_light_config(path)
+    config["enabled"] = bool(enabled)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    return config
 
 # Unitree sport-mode API ids (verified against the official Unitree ROS2
 # ros2_sport_client.h / .cpp and go2w_cmd_vel_control_node.cpp).
@@ -399,6 +438,34 @@ def invoke_ddgng_service(
         timeout=12.0,
         check=False,
     )
+
+
+def restart_active_realsense_workloads(ssh_host: str = "") -> list:
+    """Restart only active camera owners so a changed IR setting is applied."""
+    restarted = []
+    for service, status in (
+        (OM6DOF_PERCEPTION_SERVICE, perception_service_status(ssh_host)),
+        (OM6DOF_DDGNG_SERVICE, ddgng_service_status(ssh_host)),
+    ):
+        if not status.get("active"):
+            continue
+        completed = subprocess.run(
+            _remote_command(ssh_host, [
+                "/usr/bin/systemctl", "--machine=kublab@", "--user",
+                "restart", service,
+            ]),
+            capture_output=True,
+            text=True,
+            timeout=12.0,
+            check=False,
+        )
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(
+                f"could not restart {service}: {detail or 'unknown error'}"
+            )
+        restarted.append(service)
+    return restarted
 
 
 def csrf_token_matches(provided: str, expected: str) -> bool:
@@ -3438,6 +3505,9 @@ def render_game_mobile_page(
     """Fullscreen game-inspired two-stick page for phones."""
     fields = status_fields(node, cam, audio)
     csrf = html.escape(node.csrf_token, quote=True)
+    low_light = load_low_light_config()
+    low_light_action = "disable" if low_light["enabled"] else "enable"
+    low_light_button = "Low-light off" if low_light["enabled"] else "Low-light"
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#070b13"><title>OM6DOF Game Control</title>
@@ -3450,7 +3520,7 @@ def render_game_mobile_page(
   <div class="game-status" id="game_status">ENABLE CONTROL TO ARM<br><span id="st_control_mode">{fields['control_mode']}</span> · <span id="st_torque_state">{fields['torque_state']}</span></div>
   <div class="game-stick left disabled" id="game_left"><div class="game-knob" id="game_left_knob"></div><span class="game-label">PAIR 1 · axes 1 / 2</span></div>
   <div class="game-stick right disabled" id="game_right"><div class="game-knob" id="game_right_knob"></div><span class="game-label">PAIR 2 · axes 3 / 4</span></div>
-  <div class="game-menu"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">Start camera</button></form><form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="stop_perception_btn" type="submit">Stop camera</button></form></div>
+  <div class="game-menu"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">Start camera</button></form><form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="stop_perception_btn" type="submit">Stop camera</button></form><form method="POST" action="/set_low_light"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{low_light_action}"><button type="submit">{low_light_button}</button></form></div>
   <div class="game-actions"><form method="POST" action="/mode_joint"><button type="submit">▶ Enable</button></form><form method="POST" action="/mode_autonomous"><button class="stop" type="submit">■ Stop</button></form><form method="POST" action="/rest_position" onsubmit="return confirm('Move the arm to rest position? Keep the workspace clear.')"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">↩ Rest</button></form></div>
 </main>{SCRIPTS}</body></html>"""
 
@@ -4013,6 +4083,27 @@ def render_page(
       so two processes do not open the camera at the same time.</p>
     </div>
     """
+    low_light = load_low_light_config()
+    low_light_state = "ON" if low_light["enabled"] else "OFF"
+    low_light_action = "disable" if low_light["enabled"] else "enable"
+    low_light_button = (
+        "Disable low-light mode" if low_light["enabled"] else "Enable low-light mode"
+    )
+    low_light_html = f"""
+    <div class="card">
+      <h2>🌙 RealSense low-light mode</h2>
+      <p>Status: <strong>{low_light_state}</strong></p>
+      <form class="inline" method="POST" action="/set_low_light">
+        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
+        <input type="hidden" name="action" value="{low_light_action}">
+        <button type="submit">{low_light_button}</button>
+      </form>
+      <p class="small">When enabled, the active RealSense workload is restarted
+      with the available device low-light setting (IR emitter/laser when supported,
+      otherwise auto exposure). YOLO object names still require visible
+      light, so use a small white LED if labels are needed.</p>
+    </div>
+    """
 
     # --- AI chat card (model selector = local Ollama models + codex + claude) ---
     # Smallest models first so the default selection is the one most likely to
@@ -4118,6 +4209,7 @@ Snapshot {now}.</p>
     {arm_service_html if om6dof_enabled else ""}
     {perception_html if om6dof_enabled else ""}
     {ddgng_html if om6dof_enabled else ""}
+    {low_light_html if om6dof_enabled else ""}
   </div>
   <div>
     {teleop_html if om6dof_enabled else ""}
@@ -4245,6 +4337,36 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
             self.end_headers()
 
         def do_POST(self):
+            if self.path == "/set_low_light":
+                try:
+                    form = self._read_form(512)
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_html(
+                        f"<h2>Request rejected</h2><p>{html.escape(str(exc))}</p>",
+                        400,
+                    )
+                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                    return self._send_html(
+                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
+                        403,
+                    )
+                action = form.get("action", "")
+                if action not in ("enable", "disable"):
+                    return self._send_html("<h2>Invalid low-light action</h2>", 400)
+                try:
+                    config = save_low_light_config(action == "enable")
+                    restarted = restart_active_realsense_workloads(
+                        getattr(node, "robot_ssh_host", "")
+                    )
+                    node.flash = (
+                        f"RealSense low-light mode {'enabled' if config['enabled'] else 'disabled'}"
+                        + (f"; restarted {', '.join(restarted)}."
+                           if restarted else ". It will apply when a camera workload starts.")
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    node.flash = f"Low-light setting saved, but camera restart failed: {exc}"
+                node.get_logger().info(node.flash)
+                return self._redirect_home()
             if self.path == "/audio_pipeline":
                 try:
                     form = self._read_form(1024)
