@@ -1110,6 +1110,54 @@ class MonitorNode(Node):
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
+    def request_web_jog_dual(
+        self, mode: str, left_pair: int, left_x: float, left_y: float,
+        right_pair: int, right_x: float, right_y: float,
+    ) -> Tuple[bool, str]:
+        """Publish two independent joystick pairs as one bounded arm command."""
+        normalized = str(mode).strip().upper()
+        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+            return False, "Joystick rejected: invalid operation mode."
+        try:
+            left_pair, right_pair = int(left_pair), int(right_pair)
+            left_x, left_y = float(left_x), float(left_y)
+            right_x, right_y = float(right_x), float(right_y)
+        except (TypeError, ValueError):
+            return False, "Joystick rejected: invalid joystick value."
+        values_to_check = (left_x, left_y, right_x, right_y)
+        if (left_pair not in (0, 1, 2) or right_pair not in (0, 1, 2)
+                or left_pair == right_pair or not all(
+                    math.isfinite(value) and -1.0 <= value <= 1.0
+                    for value in values_to_check)):
+            return False, "Joystick rejected: invalid dual-stick command."
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, "Joystick rejected: enable streaming control first."
+            if self.control_mode != normalized:
+                return False, (
+                    f"Joystick rejected: controller is in {self.control_mode or 'UNKNOWN'}, "
+                    f"not {normalized}."
+                )
+            if self.arm_target_active or self.pickup_busy:
+                return False, "Joystick rejected: an arm target or pickup is active."
+            if self.object_tracking_active or self.object_search_active:
+                return False, "Joystick rejected: tracking or search is active."
+            if self._arm_restart_phase == "restarting":
+                return False, "Joystick rejected: the OM6DOF stack is restarting."
+        speed_pairs = {
+            "JOINT": ((0.25, 0.25), (0.25, 0.25), (0.25, 0.25)),
+            "CARTESIAN": ((0.03, 0.03), (0.03, 0.35), (0.35, 0.35)),
+            "CYLINDRICAL": ((0.025, 0.20), (0.025, 0.35), (0.35, 0.35)),
+        }
+        command = [0.0] * 6
+        for pair, x, y in ((left_pair, left_x, left_y),
+                           (right_pair, right_x, right_y)):
+            index = pair * 2
+            x_speed, y_speed = speed_pairs[normalized][pair]
+            command[index], command[index + 1] = x * x_speed, y * y_speed
+        self.pub_web_jog.publish(Float64MultiArray(data=command))
+        return True, ""
+
     def request_arm_target(
         self, mode: str, values: List[float]
     ) -> Tuple[bool, str]:
@@ -2371,6 +2419,11 @@ main{padding:16px;max-width:1100px;margin:0 auto}
 .mobile-main .webjog>div:last-child{width:100%}.mobile-main .jogaxes{grid-template-columns:repeat(3,minmax(0,1fr))}
 .mobile-main .robotviz-wrap{height:245px}.mobile-main .cam{max-height:42vh;object-fit:cover}
 @media(min-width:681px){.mobile-main .webjog{grid-template-columns:270px 1fr;justify-items:initial}.mobile-main .webstick{width:250px;height:250px}}
+.game-page{overflow:hidden;background:#05080e}.game-shell{position:fixed;inset:0;background:#070b13}
+.game-camera{position:absolute;inset:0;background:radial-gradient(circle at 50% 35%,#182535,#070b13 75%)}
+.game-camera img{width:100%;height:100%;object-fit:cover;display:none}.game-vignette{position:absolute;inset:0;pointer-events:none;background:linear-gradient(#05080e99,transparent 28%,transparent 70%,#05080ecc)}
+.game-top{position:absolute;inset:calc(env(safe-area-inset-top) + 10px) 12px auto;z-index:10;display:flex;justify-content:space-between;gap:8px;pointer-events:none}.game-chip{pointer-events:auto;padding:7px 10px;border:1px solid #7c91ad77;border-radius:10px;background:#0b1220c9;backdrop-filter:blur(10px);font-size:12px}.game-mini{position:absolute;left:12px;top:62px;z-index:11;width:132px;height:132px;border:1px solid #8ca6c488;border-radius:14px;background:#0b1220d9;backdrop-filter:blur(10px);overflow:hidden}.game-mini canvas{width:100%;height:100%;display:block}.game-mini .robotviz-badge{font-size:9px;left:5px;top:5px}.game-mode{position:absolute;top:62px;right:12px;z-index:11;width:142px;background:#0b1220d9;border:1px solid #8ca6c488;border-radius:10px;color:#fff;padding:9px;backdrop-filter:blur(10px)}
+.game-stick{position:absolute;bottom:calc(env(safe-area-inset-bottom) + 18px);z-index:12;width:142px;height:142px;border-radius:50%;border:1px solid #b9d0ed77;background:radial-gradient(circle,#7aa2d433 0 20%,#0b1422a8 21% 100%);box-shadow:inset 0 0 0 18px #ffffff0a,0 8px 28px #0008;touch-action:none}.game-stick::before,.game-stick::after{content:"";position:absolute;background:#b9d0ed44}.game-stick::before{left:50%;top:9px;bottom:9px;width:1px}.game-stick::after{top:50%;left:9px;right:9px;height:1px}.game-stick.left{left:18px}.game-stick.right{right:18px}.game-knob{position:absolute;left:50%;top:50%;width:52px;height:52px;border-radius:50%;transform:translate(-50%,-50%);background:radial-gradient(circle at 35% 30%,#d7ecff,#4b8ecc);box-shadow:0 4px 16px #0009;border:1px solid #e9f6ff99}.game-stick.disabled{opacity:.4;filter:grayscale(.9)}.game-label{position:absolute;bottom:-23px;width:100%;text-align:center;font-size:11px;color:#d8e9ff;text-shadow:0 1px 3px #000}.game-actions{position:absolute;z-index:13;left:50%;bottom:calc(env(safe-area-inset-bottom) + 12px);transform:translateX(-50%);display:flex;gap:7px}.game-actions button{min-height:40px;padding:8px 11px;background:#0b1220dc;border:1px solid #7c91ad88;backdrop-filter:blur(10px);font-size:11px}.game-actions .stop{background:#7f1d1dcc}.game-help{position:absolute;z-index:11;left:50%;top:calc(env(safe-area-inset-top) + 14px);transform:translateX(-50%);font-size:11px;color:#cad8ea;text-align:center;pointer-events:none}.game-menu{position:absolute;right:12px;bottom:calc(env(safe-area-inset-bottom) + 178px);z-index:12;width:158px;display:grid;gap:6px}.game-menu button{min-height:35px;background:#0b1220dc;border:1px solid #7c91ad88;font-size:11px}.game-status{position:absolute;left:12px;bottom:calc(env(safe-area-inset-bottom) + 178px);z-index:12;font-size:11px;color:#d8e9ff;background:#0b1220c9;padding:7px 9px;border-radius:8px;backdrop-filter:blur(10px)}
 .card{background:#1c1f27;border:1px solid #2a2e39;border-radius:10px;padding:14px;
   margin-bottom:16px}
 .card h2{font-size:14px;margin:0 0 10px;color:#9aa4b2;text-transform:uppercase;
@@ -2567,6 +2620,17 @@ function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;web
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
 function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode');if(!stick||!mode)return;mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};stick.onpointerdown=e=>{if(!webJogAllowed)return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
 
+// Game-style mobile controls. Both sticks are combined into one six-axis
+// command so they cannot overwrite one another on the ROS control topic.
+const gameJog={left:{pair:0,x:0,y:0,held:false},right:{pair:1,x:0,y:0,held:false},allowed:false,timer:null};
+function gameMode(){return document.getElementById('game_mode')?.value||'JOINT'}
+function setGameKnob(side){const s=gameJog[side],knob=document.getElementById('game_'+side+'_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(s.x*43)+'px),calc(-50% + '+(-s.y*43)+'px))'}
+function releaseGameStick(side){const s=gameJog[side];s.held=false;s.x=0;s.y=0;setGameKnob(side);if(!gameJog.left.held&&!gameJog.right.held&&gameJog.timer){clearInterval(gameJog.timer);gameJog.timer=null;sendGameJog(true)}}
+function updateGameStick(side,event){const stick=document.getElementById('game_'+side);if(!stick)return;const rect=stick.getBoundingClientRect(),radius=Math.min(rect.width,rect.height)*.34;let x=(event.clientX-(rect.left+rect.width/2))/radius,y=-(event.clientY-(rect.top+rect.height/2))/radius,length=Math.hypot(x,y);if(length>1){x/=length;y/=length}gameJog[side].x=x;gameJog[side].y=y;setGameKnob(side)}
+async function sendGameJog(zero=false){if(!zero&&!gameJog.allowed)return;const left=gameJog.left,right=gameJog.right,body=new URLSearchParams({csrf:document.getElementById('game_controls')?.dataset.csrf||'',mode:gameMode(),left_pair:String(left.pair),left_x:String(zero?0:left.x),left_y:String(zero?0:left.y),right_pair:String(right.pair),right_x:String(zero?0:right.x),right_y:String(zero?0:right.y)});try{const r=await fetch('/web_jog_dual',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseGameStick('left');releaseGameStick('right')}}catch(_e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseGameStick('left');releaseGameStick('right')}}}
+function updateGameJogAvailability(d){gameJog.allowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;for(const side of ['left','right']){const stick=document.getElementById('game_'+side);if(stick)stick.classList.toggle('disabled',!gameJog.allowed)}const status=document.getElementById('game_status');if(status)status.textContent=gameJog.allowed?'HOLD STICK TO MOVE':'ENABLE CONTROL TO ARM';if(!gameJog.allowed){releaseGameStick('left');releaseGameStick('right')}}
+function setupGamePads(){const mode=document.getElementById('game_mode');if(!mode)return;mode.onchange=()=>{releaseGameStick('left');releaseGameStick('right')};for(const side of ['left','right']){const stick=document.getElementById('game_'+side);if(!stick)continue;stick.onpointerdown=e=>{if(!gameJog.allowed)return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);gameJog[side].held=true;updateGameStick(side,e);sendGameJog();if(!gameJog.timer)gameJog.timer=setInterval(sendGameJog,40)};stick.onpointermove=e=>{if(gameJog[side].held)updateGameStick(side,e)};['pointerup','pointercancel','lostpointercapture'].forEach(name=>stick.addEventListener(name,()=>releaseGameStick(side)));}window.addEventListener('blur',()=>{releaseGameStick('left');releaseGameStick('right')});window.addEventListener('pagehide',()=>{releaseGameStick('left');releaseGameStick('right')});updateGameJogAvailability({})}
+
 // Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
 // om6dof_description/urdf/om6dof.urdf.xacro; values come from measured
 // /joint_states, never from commanded targets.
@@ -2673,6 +2737,7 @@ async function pollStatus(){
         || !['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value);
     }
     updateWebJogAvailability(d);
+    updateGameJogAvailability(d);
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
     if(cameraCard && cameraImage && d.camera_available!==undefined){
@@ -2982,6 +3047,7 @@ document.addEventListener('DOMContentLoaded',function(){
   updateArmTargetSchema(false);
   setupThemeToggle();
   setupWebJog();
+  setupGamePads();
 });
 </script>
 """
@@ -3364,6 +3430,29 @@ def render_mobile_page(
   </div>
   {robot_viz}
 </div></main>{SCRIPTS}</body></html>"""
+
+
+def render_game_mobile_page(
+        node: MonitorNode, cam: ForwardedImageStream,
+        audio: Optional[ForwardedPcmStream] = None) -> str:
+    """Fullscreen game-inspired two-stick page for phones."""
+    fields = status_fields(node, cam, audio)
+    csrf = html.escape(node.csrf_token, quote=True)
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#070b13"><title>OM6DOF Game Control</title>
+<style>{CSS}</style></head><body class="game-page"><main class="game-shell" id="game_controls" data-csrf="{csrf}">
+  <div class="game-camera" id="perception_camera_card"><img id="perception_camera_image" alt="RealSense camera"><div class="game-vignette"></div></div>
+  <div class="game-top"><span class="game-chip">🦾 <span id="st_arm_stack">{fields['arm_stack']}</span></span><a class="game-chip" href="/">Desktop</a></div>
+  <div class="game-help">Two-stick arm control · release either stick to stop that pair</div>
+  <div class="game-mini"><canvas id="robot_visualizer" aria-label="Live TF mini map"></canvas><span class="robotviz-badge pill warn" id="robotviz_status">WAITING</span></div>
+  <select class="game-mode" id="game_mode" aria-label="Arm command mode"><option value="JOINT">JOINT</option><option value="CARTESIAN">CARTESIAN</option><option value="CYLINDRICAL">CYLINDRICAL</option></select>
+  <div class="game-status" id="game_status">ENABLE CONTROL TO ARM<br><span id="st_control_mode">{fields['control_mode']}</span> · <span id="st_torque_state">{fields['torque_state']}</span></div>
+  <div class="game-stick left disabled" id="game_left"><div class="game-knob" id="game_left_knob"></div><span class="game-label">PAIR 1 · axes 1 / 2</span></div>
+  <div class="game-stick right disabled" id="game_right"><div class="game-knob" id="game_right_knob"></div><span class="game-label">PAIR 2 · axes 3 / 4</span></div>
+  <div class="game-menu"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">Start camera</button></form><form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="stop_perception_btn" type="submit">Stop camera</button></form></div>
+  <div class="game-actions"><form method="POST" action="/mode_joint"><button type="submit">▶ Enable</button></form><form method="POST" action="/mode_autonomous"><button class="stop" type="submit">■ Stop</button></form><form method="POST" action="/rest_position" onsubmit="return confirm('Move the arm to rest position? Keep the workspace clear.')"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">↩ Rest</button></form></div>
+</main>{SCRIPTS}</body></html>"""
 
 
 def render_page(
@@ -4103,7 +4192,7 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json({"error": str(exc)}, 500)
             if self.path in ("/mobile", "/mobile/"):
                 try:
-                    return self._send_html(render_mobile_page(node, cam, audio))
+                    return self._send_html(render_game_mobile_page(node, cam, audio))
                 except Exception as exc:
                     return self._send_html(
                         f"<pre>mobile render error: {html.escape(str(exc))}</pre>",
@@ -4338,6 +4427,22 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                         )
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
+            if self.path == "/web_jog_dual":
+                try:
+                    form = self._read_form(768)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({
+                            "ok": False, "message": "Invalid control token."
+                        }, 403)
+                    ok, message = node.request_web_jog_dual(
+                        form.get("mode", ""), form.get("left_pair", ""),
+                        form.get("left_x", ""), form.get("left_y", ""),
+                        form.get("right_pair", ""), form.get("right_x", ""),
+                        form.get("right_y", ""),
+                    )
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
             if self.path == "/web_jog":
                 try:
                     form = self._read_form(512)

@@ -284,9 +284,17 @@ For this AGX, the current MagicDNS address is:
 http://agx.tail455172.ts.net:8080/mobile
 ```
 
-The page is designed for a phone screen and contains large safety controls,
-mode selection, a touch joystick, the RealSense preview, and a compact live TF
-view. It uses the same ROS control path and safeguards as the desktop page.
+The page is designed as a game-style control screen: the RealSense camera fills
+the screen, two semi-transparent touch joysticks overlay the video, and a
+compact live TF/joint-state mini-map remains in the upper-left corner. The
+left stick controls axis pair 1 (axes 1/2) and the right stick controls axis
+pair 2 (axes 3/4). Both pairs are combined into one bounded six-axis ROS
+command, so one stick cannot overwrite the other. The mode selector changes
+the meanings of those axes between JOINT, CARTESIAN, and CYLINDRICAL.
+
+Enable control, Stop control, Rest, and camera controls remain available as
+compact overlays. The page uses the same ROS control path and safeguards as the
+desktop page.
 
 The touch joystick is deliberately **hold-to-move**: releasing the finger,
 leaving the page, losing browser focus, or losing the network sends a zero
