@@ -2357,6 +2357,20 @@ main{padding:16px;max-width:1100px;margin:0 auto}
   .grid,.camera-control-grid{grid-template-columns:1fr}
   .camera-control-grid .joystick-column{position:static}
 }
+.mobile-main{max-width:680px;padding:12px;margin:0 auto}
+.mobile-header{position:sticky;top:0;z-index:950;background:#1c1f27;padding:10px 12px;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid #2a2e39}
+.mobile-header h1{font-size:16px}.mobile-header .pill{white-space:nowrap}
+.mobile-grid{display:grid;gap:10px}.mobile-card{margin:0;padding:12px}
+.mobile-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.mobile-actions button{width:100%;min-height:52px;font-size:14px;font-weight:700}
+.mobile-actions .wide{grid-column:1/-1}.mobile-mode{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.mobile-mode button{min-height:42px;font-size:12px}.mobile-status{display:grid;grid-template-columns:1fr 1fr;gap:7px;font-size:13px}
+.mobile-status div{padding:8px;border:1px solid #2a2e39;border-radius:7px;background:#161923}.mobile-status b{display:block;color:#9aa4b2;font-size:11px;margin-bottom:3px}
+.mobile-main .webjog{grid-template-columns:1fr;justify-items:center}.mobile-main .webstick{width:min(72vw,270px);height:min(72vw,270px)}
+.mobile-main .webjog>div:last-child{width:100%}.mobile-main .jogaxes{grid-template-columns:repeat(3,minmax(0,1fr))}
+.mobile-main .robotviz-wrap{height:245px}.mobile-main .cam{max-height:42vh;object-fit:cover}
+@media(min-width:681px){.mobile-main .webjog{grid-template-columns:270px 1fr;justify-items:initial}.mobile-main .webstick{width:250px;height:250px}}
 .card{background:#1c1f27;border:1px solid #2a2e39;border-radius:10px;padding:14px;
   margin-bottom:16px}
 .card h2{font-size:14px;margin:0 0 10px;color:#9aa4b2;text-transform:uppercase;
@@ -3277,6 +3291,81 @@ def status_fields(node, cam=None, audio=None) -> dict:
     }
 
 
+def render_mobile_page(
+        node: MonitorNode, cam: ForwardedImageStream,
+        audio: Optional[ForwardedPcmStream] = None) -> str:
+    """Phone-first arm control page; it reuses the same guarded HTTP actions."""
+    fields = status_fields(node, cam, audio)
+    csrf = html.escape(node.csrf_token, quote=True)
+    mobile_joystick = f"""
+    <div class="card mobile-card" id="web_jog" data-csrf="{csrf}">
+      <h2>🕹️ Hold-to-move joystick</h2>
+      <div class="webjog">
+        <div class="webstick disabled" id="web_stick" role="application"
+             aria-label="Hold and drag to move the selected robot axes">
+          <div class="webstick-knob" id="web_stick_knob"></div>
+        </div>
+        <div>
+          <label class="small" for="web_jog_mode">Command mode</label>
+          <select class="targetmode" id="web_jog_mode">
+            <option value="JOINT">JOINT</option>
+            <option value="CARTESIAN">CARTESIAN</option>
+            <option value="CYLINDRICAL">CYLINDRICAL</option>
+          </select>
+          <div class="jogaxes" id="web_jog_axes"></div>
+          <p class="mono jogreadout" id="web_jog_readout">Enable control first.</p>
+        </div>
+      </div>
+      <p class="small jogwarning">Hold the joystick to move. Releasing it or
+      losing the connection sends a zero command within 0.3 seconds.</p>
+    </div>
+    """
+    robot_viz = """
+    <div class="card mobile-card" id="robot_visualizer_card">
+      <h2>🦾 Live TF pose</h2>
+      <div class="robotviz-wrap"><canvas id="robot_visualizer"
+      aria-label="Live OM6DOF TF visualization"></canvas>
+      <span class="robotviz-badge pill warn" id="robotviz_status">WAITING</span></div>
+      <p class="small">Drag to rotate. Red/green/blue arrows are X/Y/Z TF axes.</p>
+    </div>
+    """
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1c1f27"><title>OM6DOF Mobile Control</title>
+<style>{CSS}</style></head><body>
+<header class="mobile-header"><h1>🦾 Mobile Arm Control</h1>
+<span id="st_arm_stack">{fields['arm_stack']}</span>
+<a class="btn ghost" href="/">Desktop</a></header>
+<main class="mobile-main"><div id="action_notice" class="actionnotice" aria-live="polite"></div>
+<div class="mobile-grid">
+  <div class="card mobile-card"><h2>Safety and ownership</h2>
+    <div class="mobile-status"><div><b>Control</b><span id="st_teleop">{fields['teleop']}</span></div>
+    <div><b>Torque</b><span id="st_torque_state">{fields['torque_state']}</span></div>
+    <div><b>Mode</b><span id="st_control_mode">{fields['control_mode']}</span></div>
+    <div><b>Arm bus</b><span id="st_arm_bus">{fields['arm_bus']}</span></div></div>
+  </div>
+  <div class="card mobile-card"><h2>Control mode</h2><div class="mobile-mode">
+    <form method="POST" action="/mode_joint"><button type="submit">JOINT</button></form>
+    <form method="POST" action="/mode_cartesian"><button type="submit">CARTESIAN</button></form>
+    <form method="POST" action="/mode_cylindrical"><button type="submit">CYLINDRICAL</button></form>
+  </div></div>
+  <div class="mobile-actions">
+    <form method="POST" action="/mode_joint"><button type="submit">▶ Enable control</button></form>
+    <form method="POST" action="/mode_autonomous"><button class="stop" type="submit">■ Stop control</button></form>
+    <form method="POST" action="/rest_position" onsubmit="return confirm('Move the arm to its captured rest position? Keep the workspace clear.')"><input type="hidden" name="csrf" value="{csrf}"><button class="wide ghost" type="submit">↩ Back to rest position</button></form>
+    <form method="POST" action="/disable_torque" onsubmit="return confirm('Disable torque? Support the arm before continuing.')"><input type="hidden" name="csrf" value="{csrf}"><button class="wide kill" id="disable_torque_btn" type="submit">⚠ Disable torque</button></form>
+  </div>
+  {mobile_joystick}
+  <div class="card mobile-card" id="perception_camera_card"><h2>📷 RealSense camera</h2>
+    <img class="cam" id="perception_camera_image" style="display:none" alt="RealSense perception stream">
+    <p id="perception_camera_status">Waiting for RealSense perception.</p>
+    <div class="mobile-actions"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">▶ Start perception</button></form>
+    <form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button class="stop" id="stop_perception_btn" type="submit">■ Stop perception</button></form></div>
+  </div>
+  {robot_viz}
+</div></main>{SCRIPTS}</body></html>"""
+
+
 def render_page(
         node: MonitorNode,
         cam: ForwardedImageStream,
@@ -3903,6 +3992,7 @@ def render_page(
 <button class="theme-toggle" id="theme_toggle" type="button" aria-pressed="false" aria-label="Switch theme">
   <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span><span class="theme-switch-icon theme-moon"></span><span class="theme-switch-icon theme-sun"></span></span><span class="theme-label">Dark</span>
 </button>
+<a class="btn ghost" href="/mobile">📱 Mobile control</a>
 <a class="btn ghost" href="/">↻ Refresh</a>
 <form class="inline" method="POST" action="/restart"
       onsubmit="return confirm('Restart the web monitor service? The page will reconnect in a few seconds.')">
@@ -4011,6 +4101,14 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json(node.joint_state_snapshot())
                 except Exception as exc:
                     return self._send_json({"error": str(exc)}, 500)
+            if self.path in ("/mobile", "/mobile/"):
+                try:
+                    return self._send_html(render_mobile_page(node, cam, audio))
+                except Exception as exc:
+                    return self._send_html(
+                        f"<pre>mobile render error: {html.escape(str(exc))}</pre>",
+                        500,
+                    )
             if self.path in ("/", "/index.html"):
                 try:
                     return self._send_html(render_page(node, cam, audio))

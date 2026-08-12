@@ -270,6 +270,31 @@ running before troubleshooting the client connection:
 systemctl is-active om6dof-web-monitor.service
 ```
 
+### Phone-first arm control
+
+Open the dedicated mobile page instead of the desktop dashboard:
+
+```text
+http://<agx-tailscale-ip>:8080/mobile
+```
+
+For this AGX, the current MagicDNS address is:
+
+```text
+http://agx.tail455172.ts.net:8080/mobile
+```
+
+The page is designed for a phone screen and contains large safety controls,
+mode selection, a touch joystick, the RealSense preview, and a compact live TF
+view. It uses the same ROS control path and safeguards as the desktop page.
+
+The touch joystick is deliberately **hold-to-move**: releasing the finger,
+leaving the page, losing browser focus, or losing the network sends a zero
+velocity command. Enable control first, select the intended mode and axis pair,
+and keep the arm workspace clear before moving. Use **Stop control** to return
+to autonomous ownership; **Disable torque** is guarded because the arm can
+fall under gravity.
+
 ## Resolved issue: Perception start failed from another computer
 
 **Symptom:** Selecting **Start perception** in the web monitor showed a
