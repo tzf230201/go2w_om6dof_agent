@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="960" height="420" role="img" aria-label="Button classes by consequence: primary, neutral, stop, caution and danger">
+  <title>Button classes by consequence</title>
+  <style>
+    .bg{fill:#ffffff}
+    .h{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;fill:#1f2328}
+    .n{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11.5px;fill:#656d76}
+    .cls{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;font-weight:600;fill:#1f2328}
+    .mean{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12.5px;fill:#1f2328}
+    .ex{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11.5px;fill:#656d76}
+    .lbl{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;font-weight:500;text-anchor:middle}
+    .hd{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10.5px;font-weight:700;fill:#8c959f;letter-spacing:.09em}
+    .rule{stroke:#e8ebef;stroke-width:1}
+  </style>
+
+  <rect class="bg" width="960" height="420" rx="10"/>
+  <text class="h" x="40" y="38">Buttons are styled by consequence</text>
+  <text class="n" x="40" y="58">Pressing tells you what will happen before the confirm dialog appears — so the dialog is not the only signal of danger.</text>
+
+  <text class="hd" x="40"  y="88">APPEARANCE</text>
+  <text class="hd" x="230" y="88">CLASS</text>
+  <text class="hd" x="366" y="88">MEANS</text>
+  <text class="hd" x="628" y="88">USED BY</text>
+  <line class="rule" x1="40" y1="96" x2="920" y2="96"/>
+
+  <!-- primary -->
+  <rect x="40" y="110" width="168" height="30" rx="15" fill="#5b5bd6"/>
+  <text class="lbl" x="124" y="130" fill="#ffffff">Start perception</text>
+  <text class="cls"  x="230" y="130">b-primary</text>
+  <text class="mean" x="366" y="130">Main positive action</text>
+  <text class="ex"   x="628" y="130">7 buttons — enable torque, start…</text>
+  <line class="rule" x1="40" y1="152" x2="920" y2="152"/>
+
+  <!-- neutral -->
+  <rect x="40" y="166" width="168" height="30" rx="15" fill="#f0f0f3" stroke="#e2e2e7"/>
+  <text class="lbl" x="124" y="186" fill="#1c2024">Set target</text>
+  <text class="cls"  x="230" y="186">b-neutral</text>
+  <text class="mean" x="366" y="186">No physical effect</text>
+  <text class="ex"   x="628" y="186">6 buttons — CARTESIAN, set target…</text>
+  <line class="rule" x1="40" y1="208" x2="920" y2="208"/>
+
+  <!-- stop -->
+  <rect x="40" y="222" width="168" height="30" rx="15" fill="#ffffff" stroke="#c9cad2"/>
+  <text class="lbl" x="124" y="242" fill="#60646c">Stop perception</text>
+  <text class="cls"  x="230" y="242">b-stop</text>
+  <text class="mean" x="366" y="242">Halts something running</text>
+  <text class="ex"   x="628" y="242">7 buttons — deliberately not red</text>
+  <line class="rule" x1="40" y1="264" x2="920" y2="264"/>
+
+  <!-- caution -->
+  <rect x="40" y="278" width="168" height="30" rx="15" fill="#ffffff" stroke="#ab6400" stroke-width="1.4"/>
+  <text class="lbl" x="124" y="298" fill="#ab6400">Run target</text>
+  <text class="cls"  x="230" y="298">b-caution</text>
+  <text class="mean" x="366" y="298">The robot will move</text>
+  <text class="ex"   x="628" y="298">4 — READY, rest, run target, pickup</text>
+  <line class="rule" x1="40" y1="320" x2="920" y2="320"/>
+
+  <!-- danger -->
+  <rect x="40" y="334" width="168" height="30" rx="15" fill="#ffffff" stroke="#ce2c31" stroke-width="1.4"/>
+  <text class="lbl" x="124" y="354" fill="#ce2c31">Disable torque</text>
+  <text class="cls"  x="230" y="354">b-danger</text>
+  <text class="mean" x="366" y="354">Destructive</text>
+  <text class="ex"   x="628" y="354">4 — torque off, restart ×2, kill</text>
+
+  <rect x="40" y="380" width="880" height="28" rx="8" fill="#fff5f5" stroke="#f0c2c4"/>
+  <text class="ex" x="58" y="398" style="fill:#8c2f33">Red is reserved for those four. Nine buttons used to be red, including every stop — which left the colour meaningless.</text>
+</svg>

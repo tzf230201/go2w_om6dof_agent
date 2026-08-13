@@ -17,6 +17,8 @@ to an untrusted network.
 
 ## Interface layout
 
+![Section layout of the dashboard](docs/interface-layout.svg)
+
 Cards are grouped into sections that follow the operating sequence rather
 than the order the template happens to emit them:
 
@@ -39,6 +41,8 @@ Go2W-disabled layout tidy without a second template. Headings form a single
 outline: `h1` page, `h2` section, `h3` card, `h4` sub-block.
 
 ## Button colours mean consequence
+
+![Button classes by consequence](docs/button-taxonomy.svg)
 
 Buttons are styled by what pressing them does, never for decoration:
 
@@ -124,6 +128,8 @@ below 20%.
 
 ## Current pipeline
 
+![Voice pipeline from the DJI microphone to the Go2W speaker](docs/voice-pipeline.svg)
+
 ```text
 DJI Wireless Mic Rx
   -> PulseAudio stereo 48 kHz
@@ -135,6 +141,10 @@ DJI Wireless Mic Rx
   -> bounded ROS action + response in the web monitor
   -> Kokoro natural TTS -> 44.1 kHz WAV -> Go2W audiohub speaker
 ```
+
+Every stage runs on the AGX; only the synthesized audio leaves for the Go2W
+body speaker. The diagrams in this file live in [`docs/`](docs) and are plain
+SVG, so they diff as text and need no build step.
 
 The web microphone playback toggle only controls playback and network streaming
 to that browser. Disabling playback does not stop audio capture, STT, or the

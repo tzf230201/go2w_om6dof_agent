@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" role="img" aria-label="Dashboard section layout: Overview, Robot Agent, Live view, Arm control, Perception and mapping, Audio and input devices">
+  <title>Dashboard section layout</title>
+  <defs>
+    <marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8250df"/>
+    </marker>
+    <style>
+      .bg{fill:#ffffff}
+      .sec{fill:#f6f8fa;stroke:#d0d7de;stroke-width:1}
+      .card{fill:#ffffff;stroke:#d8dee4;stroke-width:1}
+      .h{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;fill:#1f2328}
+      .sh{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13.5px;font-weight:700;fill:#1f2328}
+      .c{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11.5px;fill:#424a53}
+      .n{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11.5px;fill:#656d76}
+      .step{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;fill:#8250df;letter-spacing:.06em}
+    </style>
+  </defs>
+
+  <rect class="bg" width="960" height="470" rx="10"/>
+  <text class="h" x="40" y="38">Section layout</text>
+  <text class="n" x="40" y="58">Cards are grouped by the order the operations actually happen in, not the order the template emits them.</text>
+
+  <!-- Overview -->
+  <rect class="sec" x="40" y="76" width="440" height="72" rx="9"/>
+  <text class="sh" x="58" y="99">Overview</text>
+  <rect class="card" x="58" y="108" width="180" height="26" rx="6"/>
+  <text class="c" x="70" y="125">Robot status</text>
+
+  <!-- Robot Agent -->
+  <rect class="sec" x="500" y="76" width="420" height="72" rx="9"/>
+  <text class="sh" x="518" y="99">Robot Agent</text>
+  <rect class="card" x="518" y="108" width="200" height="26" rx="6"/>
+  <text class="c" x="530" y="125">Chat command channel</text>
+  <text class="n" x="730" y="125">Go2W builds only</text>
+
+  <!-- Live view -->
+  <rect class="sec" x="40" y="162" width="880" height="72" rx="9"/>
+  <text class="sh" x="58" y="185">Live view</text>
+  <rect class="card" x="58" y="194" width="200" height="26" rx="6"/>
+  <text class="c" x="70" y="211">RealSense preview</text>
+  <rect class="card" x="272" y="194" width="200" height="26" rx="6"/>
+  <text class="c" x="284" y="211">DD-GNG YOLO preview</text>
+
+  <!-- Arm control -->
+  <rect class="sec" x="40" y="248" width="880" height="106" rx="9"/>
+  <text class="sh" x="58" y="271">Arm control</text>
+  <text class="n" x="152" y="271">power → ownership → motion → feedback</text>
+
+  <rect class="card" x="58"  y="284" width="158" height="26" rx="6"/>
+  <text class="c" x="70" y="301">Hardware / torque</text>
+  <rect class="card" x="230" y="284" width="158" height="26" rx="6"/>
+  <text class="c" x="242" y="301">Arm ownership</text>
+  <rect class="card" x="402" y="284" width="158" height="26" rx="6"/>
+  <text class="c" x="414" y="301">Velocity joystick</text>
+  <rect class="card" x="574" y="284" width="158" height="26" rx="6"/>
+  <text class="c" x="586" y="301">Live position</text>
+  <rect class="card" x="746" y="284" width="158" height="26" rx="6"/>
+  <text class="c" x="758" y="301">Arm target test</text>
+
+  <text class="step" x="58"  y="332">1 POWER</text>
+  <text class="step" x="230" y="332">2 CLAIM</text>
+  <text class="step" x="402" y="332">3 MOVE</text>
+  <text class="step" x="574" y="332">4 OBSERVE</text>
+
+  <line x1="216" y1="297" x2="224" y2="297" stroke="#8250df" stroke-width="1.4" marker-end="url(#d)"/>
+  <line x1="388" y1="297" x2="396" y2="297" stroke="#8250df" stroke-width="1.4" marker-end="url(#d)"/>
+  <line x1="560" y1="297" x2="568" y2="297" stroke="#8250df" stroke-width="1.4" marker-end="url(#d)"/>
+
+  <!-- Perception -->
+  <rect class="sec" x="40" y="368" width="440" height="72" rx="9"/>
+  <text class="sh" x="58" y="391">Perception &amp; mapping</text>
+  <rect class="card" x="58" y="400" width="170" height="26" rx="6"/>
+  <text class="c" x="70" y="417">Perception</text>
+  <rect class="card" x="242" y="400" width="170" height="26" rx="6"/>
+  <text class="c" x="254" y="417">DD-GNG YOLO</text>
+
+  <!-- Audio -->
+  <rect class="sec" x="500" y="368" width="420" height="72" rx="9"/>
+  <text class="sh" x="518" y="391">Audio &amp; input devices</text>
+  <rect class="card" x="518" y="400" width="170" height="26" rx="6"/>
+  <text class="c" x="530" y="417">Live microphone</text>
+  <rect class="card" x="702" y="400" width="170" height="26" rx="6"/>
+  <text class="c" x="714" y="417">Flight stick</text>
+
+  <text class="n" x="40" y="462">Empty sections disappear on their own, which is what keeps the Go2W-disabled layout tidy without a second template.</text>
+</svg>

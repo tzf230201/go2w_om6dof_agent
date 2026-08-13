@@ -15,6 +15,8 @@ setup(
             ["resource/" + package_name],
         ),
         ("share/" + package_name, ["package.xml", "README.md"]),
+        # keeps the README's diagrams resolvable in the installed copy
+        ("share/" + package_name + "/docs", glob("docs/*.svg")),
         ("share/" + package_name + "/systemd", glob("systemd/*.service")),
         ("share/" + package_name + "/sudoers", glob("sudoers/*")),
         ("share/" + package_name + "/skills", glob("skills/*.md")),

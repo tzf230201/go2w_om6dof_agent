@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" width="960" height="400" role="img" aria-label="Voice pipeline from the DJI microphone through Whisper and Qwen3-VL to the Go2W speaker">
+  <title>Voice pipeline</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/>
+    </marker>
+    <style>
+      .bg{fill:#ffffff}
+      .box{fill:#f6f8fa;stroke:#d0d7de;stroke-width:1}
+      .ai{fill:#eef0ff;stroke:#c3c8f5;stroke-width:1}
+      .t{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;font-weight:600;fill:#1f2328}
+      .s{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;fill:#656d76}
+      .cap{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;fill:#8250df;letter-spacing:.08em}
+      .h{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;fill:#1f2328}
+      .n{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11.5px;fill:#656d76}
+      .ln{stroke:#8c959f;stroke-width:1.4;fill:none}
+    </style>
+  </defs>
+
+  <rect class="bg" width="960" height="400" rx="10"/>
+  <text class="h" x="40" y="38">Voice pipeline</text>
+  <text class="n" x="40" y="58">Everything below runs on the Jetson AGX. Only the final audio leaves for the Go2W body speaker.</text>
+
+  <text class="cap" x="40" y="92">CAPTURE AND SEGMENT</text>
+
+  <rect class="box" x="40"  y="104" width="190" height="60" rx="8"/>
+  <text class="t" x="56" y="129">DJI Wireless Mic</text>
+  <text class="s" x="56" y="148">stereo 48 kHz over USB</text>
+
+  <rect class="box" x="270" y="104" width="190" height="60" rx="8"/>
+  <text class="t" x="286" y="129">PulseAudio</text>
+  <text class="s" x="286" y="148">mono PCM, avoids ALSA lock</text>
+
+  <rect class="box" x="500" y="104" width="190" height="60" rx="8"/>
+  <text class="t" x="516" y="129">SpeexDSP + VAD</text>
+  <text class="s" x="516" y="148">denoise −18 dB, segment</text>
+
+  <rect class="ai"  x="730" y="104" width="190" height="60" rx="8"/>
+  <text class="t" x="746" y="129">Whisper large-v3</text>
+  <text class="s" x="746" y="148">CUDA, port 8178</text>
+
+  <line class="ln" x1="230" y1="134" x2="264" y2="134" marker-end="url(#a)"/>
+  <line class="ln" x1="460" y1="134" x2="494" y2="134" marker-end="url(#a)"/>
+  <line class="ln" x1="690" y1="134" x2="724" y2="134" marker-end="url(#a)"/>
+
+  <path class="ln" d="M825 164 V 196 H 135 V 232" marker-end="url(#a)"/>
+
+  <text class="cap" x="40" y="222">DECIDE AND SPEAK</text>
+
+  <rect class="ai"  x="40"  y="240" width="190" height="60" rx="8"/>
+  <text class="t" x="56" y="265">Qwen3-VL 8B</text>
+  <text class="s" x="56" y="284">Ollama, skill-driven</text>
+
+  <rect class="box" x="270" y="240" width="190" height="60" rx="8"/>
+  <text class="t" x="286" y="265">Bounded ROS action</text>
+  <text class="s" x="286" y="284">/api/sport/request</text>
+
+  <rect class="ai"  x="500" y="240" width="190" height="60" rx="8"/>
+  <text class="t" x="516" y="265">Kokoro TTS</text>
+  <text class="s" x="516" y="284">ONNX, 44.1 kHz WAV</text>
+
+  <rect class="box" x="730" y="240" width="190" height="60" rx="8"/>
+  <text class="t" x="746" y="265">Go2W body speaker</text>
+  <text class="s" x="746" y="284">audiohub megaphone</text>
+
+  <line class="ln" x1="230" y1="270" x2="264" y2="270" marker-end="url(#a)"/>
+  <line class="ln" x1="460" y1="270" x2="494" y2="270" marker-end="url(#a)"/>
+  <line class="ln" x1="690" y1="270" x2="724" y2="270" marker-end="url(#a)"/>
+
+  <rect x="40" y="326" width="880" height="46" rx="8" fill="#fff8e6" stroke="#e0c47a" stroke-width="1"/>
+  <text class="s" x="58" y="345" style="font-size:12px;fill:#6b5416">Motion commands need a wake word: “Robot, …” / “Hey robot, …”. Plain “Stop” is accepted without one.</text>
+  <text class="s" x="58" y="362" style="font-size:12px;fill:#6b5416">Audio is half duplex: while the robot speaks, the microphone feeds silence to STT so it cannot transcribe itself.</text>
+</svg>
