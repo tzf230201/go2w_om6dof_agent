@@ -1,0 +1,27 @@
+[Unit]
+Description=OM6DOF Web Monitor — AGX standalone LAN dashboard
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kublab
+Group=kublab
+# Read-only access to USB HID/joystick nodes such as /dev/input/js0.
+SupplementaryGroups=input
+Environment=HOME=/home/kublab
+# Give this system service access to kublab's lingering user manager.  The
+# perception and DD-GNG controls manage systemd --user units through this bus.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# OM6DOF is local on the AGX. Go2W remains on the NX and is intentionally not
+# required by this service.
+ExecStart=/home/kublab/ros2_ws/src/go2w_om6dof_agent/application/application_web_monitor/utility/launch_web_monitor.sh
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
