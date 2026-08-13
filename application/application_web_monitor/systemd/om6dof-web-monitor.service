@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 User=kublab
 Group=kublab
+# Read-only access to USB HID/joystick nodes such as /dev/input/js0, so the
+# flight-stick card keeps working if those nodes stop being world-readable.
+SupplementaryGroups=input
 Environment=HOME=/home/kublab
 # Give this system service access to kublab's lingering user manager.  The
 # perception and DD-GNG controls manage systemd --user units through this bus.

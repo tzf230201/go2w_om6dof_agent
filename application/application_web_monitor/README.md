@@ -15,6 +15,96 @@ Open `http://<agx-ip>:8080` from the trusted robot LAN. The HTTP server binds to
 all interfaces and currently has no login, so it must not be exposed directly
 to an untrusted network.
 
+## Interface layout
+
+Cards are grouped into sections that follow the operating sequence rather
+than the order the template happens to emit them:
+
+| Section | Cards |
+|---|---|
+| Overview | robot status |
+| Robot Agent | chat command channel (Go2W builds only) |
+| Live view | RealSense and DD-GNG camera previews |
+| Arm control | hardware/torque service, arm ownership, velocity joystick, live position, arm target |
+| Perception &amp; mapping | perception controls, DD-GNG YOLO |
+| Audio &amp; input devices | microphone pipeline, flight stick |
+
+Inside **Arm control** the order is power, then ownership, then motion, then
+feedback, because that is the order the operations must actually happen in.
+The velocity joystick and the live position view sit next to each other so
+the command and its result can be read together.
+
+Sections with no content disappear on their own, which is what keeps the
+Go2W-disabled layout tidy without a second template. Headings form a single
+outline: `h1` page, `h2` section, `h3` card, `h4` sub-block.
+
+## Button colours mean consequence
+
+Buttons are styled by what pressing them does, never for decoration:
+
+| Class | Meaning | Appearance |
+|---|---|---|
+| `b-primary` | the card's main positive action | filled accent |
+| `b-neutral` | no physical effect | grey fill |
+| `b-stop` | halts something already running | neutral outline |
+| `b-caution` | the robot will physically move | amber outline |
+| `b-danger` | destructive | red outline |
+
+Red is reserved for the four destructive controls — disable torque, restart
+the OM6DOF stack, restart the monitor, kill the monitor — so that red keeps
+its meaning. Stop actions are deliberately **not** red; when everything that
+halts something is red, red stops being a warning.
+
+The mapping lives in `BUTTON_CLASS_BY_ID` and `BUTTON_CLASS_BY_ACTION` in
+`web_monitor.py` and is applied to the finished page by
+`style_action_buttons()`. It is keyed on element id first because ids are
+stable and the client JS already depends on them: renaming a visible label
+therefore cannot silently downgrade a destructive control into an
+ordinary-looking one. Buttons that match neither table default to
+`b-neutral`.
+
+**When adding a button, add its id to that table in the same change.**
+
+## Light and dark theme
+
+Both palettes ship with the page. It follows the operating system setting by
+default, and the header toggle overrides that in either direction; the choice
+is stored in `localStorage` under `om6dof-theme`. A short script in `<head>`
+applies the stored choice before the first paint, so reloading in dark mode
+does not flash white.
+
+The 3D arm viewport stays dark in both themes. Its canvas paints its own
+scene from JavaScript, and a dark viewport inside a light application is the
+normal convention for 3D views.
+
+## Thrustmaster TCA flight-stick monitor
+
+When a USB flight stick is connected, the dashboard shows a **Flight stick
+input** card. It discovers Linux joystick devices at `/dev/input/js*`, prefers
+names containing `Thrustmaster`, `TCA`, or `Airbus`, and displays the held
+buttons, last button event, and normalized axis values. It is read-only and
+does not publish robot commands.
+
+The card is two independent blocks: an analog stage (large X/Y stick, yaw
+ring, nested small X/Y stick, and lift bar) and a plain grid of the 17
+buttons. Nothing is positioned on top of anything else, so no control can be
+clipped at any card width.
+
+Knob travel is driven by the CSS custom properties `--x`, `--y`, `--yaw`, and
+`--v`, which the client sets as unitless values between -1 and 1. CSS owns all
+of the geometry, so the stage can be resized without touching JavaScript.
+
+If the card says no joystick was detected, verify it on the AGX with:
+
+```bash
+lsusb | grep -i -E 'thrustmaster|airbus|tca'
+ls -l /dev/input/js* /dev/input/by-id/* 2>/dev/null
+```
+
+The account running `om6dof-web-monitor.service` must be allowed to read the
+matching `/dev/input/jsN` device, normally through membership in the `input`
+group.
+
 ## Top status ribbon
 
 The sticky header keeps the most useful live values visible while the page is
@@ -22,7 +112,8 @@ scrolled:
 
 - the browser's local time in `HH:MM` format;
 - RAM usage as a memory-chip gauge and percentage;
-- robot battery state of charge as a battery gauge and percentage.
+- robot battery state of charge as a battery gauge and percentage;
+- the light/dark theme toggle, and the refresh, restart, and kill controls.
 
 Hover over the RAM or battery indicator to see the detailed value. RAM details
 show used and total memory, while battery details show voltage and current. The
@@ -610,25 +701,3 @@ the current browser.
 The `systemd/` directory contains the source service units. The `sudoers/`
 directory contains the narrowly scoped permission used by the guarded OM6DOF
 restart button.
-
-## RealSense low-light mode
-
-The dashboard has a **RealSense low-light mode** card. Enable it before starting
-Perception or DD-GNG to request the connected camera's low-light setting. On a
-camera with an IR emitter, it enables the emitter and applies the configured
-laser power. On the installed D405, which exposes no controllable IR emitter or
-laser-power option, it enables auto exposure instead. If a camera workload is
-already active, the dashboard restarts only that workload so the setting takes
-effect; it does not touch the arm stack.
-
-The shared setting is stored on the AGX at:
-
-```text
-~/.config/om6dof-realsense/low_light.json
-```
-
-The default laser power is `150`. It is safely clamped to the range reported by
-a device that supports it. Low-light mode does not make YOLO RGB labels see in
-the dark:
-YOLOX still needs visible light to identify object names. Use a small white LED
-when semantic labels are needed in darkness.

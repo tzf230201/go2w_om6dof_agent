@@ -37,6 +37,7 @@ perception_camera_topic.
 from __future__ import annotations
 
 import base64
+import glob
 import html
 import json
 import math
@@ -50,11 +51,137 @@ import subprocess
 import sys
 import threading
 import time
+import struct
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional, Tuple
 from urllib.parse import parse_qs
+
+
+# Linux joystick API constants.  Reading /dev/input/js* keeps this dashboard
+# dependency-free; python-evdev is deliberately not required on the AGX.
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+JSIOCGAXES = 0x80016A11
+JSIOCGBUTTONS = 0x80016A12
+
+
+class FlightStickMonitor:
+    """Non-blocking reader for a Linux joystick device, for diagnostics only."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fd = None
+        self._path = ""
+        self._name = ""
+        self._axes = []
+        self._buttons = []
+        self._last_scan = 0.0
+        self._last_event = "No button event yet"
+        self._last_event_at = 0.0
+
+    @staticmethod
+    def _name_for(fd: int) -> str:
+        try:
+            import fcntl
+            data = bytearray(128)
+            command = 0x80006A13 + (len(data) << 16)  # JSIOCGNAME(128)
+            fcntl.ioctl(fd, command, data)
+            return bytes(data).split(b"\0", 1)[0].decode("utf-8", "replace")
+        except (ImportError, OSError):
+            return "Linux joystick"
+
+    def _close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self._fd = None
+        self._path = ""
+
+    def _scan(self) -> None:
+        self._last_scan = time.monotonic()
+        candidates = sorted(glob.glob("/dev/input/js*"))
+        selected = None
+        selected_path = ""
+        selected_name = ""
+        # Prefer the Airbus stick, while retaining any joystick as a useful
+        # fallback when its USB product name differs by firmware/driver.
+        for path in candidates:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            name = self._name_for(fd)
+            if selected is None or any(word in name.lower() for word in ("thrustmaster", "tca", "airbus")):
+                if selected is not None:
+                    os.close(selected)
+                selected, selected_path, selected_name = fd, path, name
+                if any(word in name.lower() for word in ("thrustmaster", "tca", "airbus")):
+                    break
+            else:
+                os.close(fd)
+        if selected is None:
+            self._close()
+            return
+        self._close()
+        self._fd, self._path, self._name = selected, selected_path, selected_name
+        # Store the actual selected path even if it was not the first candidate.
+        try:
+            self._path = os.readlink(f"/proc/self/fd/{selected}")
+        except OSError:
+            pass
+        self._axes = [0] * self._count(JSIOCGAXES)
+        self._buttons = [False] * self._count(JSIOCGBUTTONS)
+
+    def _count(self, command: int) -> int:
+        if self._fd is None:
+            return 0
+        try:
+            import fcntl
+            data = bytearray(1)
+            fcntl.ioctl(self._fd, command, data)
+            return int(data[0])
+        except (ImportError, OSError):
+            return 0
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            if self._fd is None or time.monotonic() - self._last_scan > 3.0:
+                self._scan()
+            if self._fd is not None:
+                while True:
+                    try:
+                        packet = os.read(self._fd, 8)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        self._close()
+                        break
+                    if len(packet) != 8:
+                        break
+                    _when, value, event_type, number = struct.unpack("IhBB", packet)
+                    event_type &= ~JS_EVENT_INIT
+                    if event_type == JS_EVENT_BUTTON and number < len(self._buttons):
+                        pressed = bool(value)
+                        self._buttons[number] = pressed
+                        self._last_event = f"Button {number + 1}: {'PRESSED' if pressed else 'released'}"
+                        self._last_event_at = time.time()
+                    elif event_type == JS_EVENT_AXIS and number < len(self._axes):
+                        self._axes[number] = value
+            return {
+                "connected": self._fd is not None,
+                "device": self._name or "No joystick detected",
+                "path": self._path,
+                "buttons": [index + 1 for index, pressed in enumerate(self._buttons) if pressed],
+                "button_count": len(self._buttons),
+                "axes": [round(value / 32767.0, 3) for value in self._axes],
+                "last_event": self._last_event,
+                "last_event_at": self._last_event_at,
+            }
 
 import rclpy
 try:
@@ -62,6 +189,7 @@ try:
 except ImportError:  # Optional on an application-only host such as the AGX.
     ListControllers = None
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 try:
@@ -72,6 +200,7 @@ except Exception:  # Optional when AGX runs the OM6DOF-only dashboard.
 from std_msgs.msg import Bool, Float64MultiArray, String, UInt8MultiArray
 from std_srvs.srv import SetBool, Trigger
 from sensor_msgs.msg import CompressedImage, JointState
+from control_msgs.action import GripperCommand
 from tf2_msgs.msg import TFMessage
 
 from application_web_monitor.audio_control import (
@@ -95,14 +224,6 @@ OM6DOF_SERVICE = "om6dof-hardware.service"
 OM6DOF_PERCEPTION_SERVICE = "om6dof-perception.service"
 OM6DOF_PICK_SERVICE = "om6dof-perception-pick.service"
 OM6DOF_DDGNG_SERVICE = "om6dof-dd-gng.service"
-LOW_LIGHT_CONFIG_PATH = os.path.expanduser(
-    "~/.config/om6dof-realsense/low_light.json"
-)
-LOW_LIGHT_DEFAULT = {
-    "enabled": False,
-    "laser_power": 150.0,
-    "brightness_threshold": 45.0,
-}
 PICKUP_STATUS_TIMEOUT_S = 3.0
 OM6DOF_REQUIRED_NODES = frozenset({
     "controller_manager",
@@ -146,37 +267,6 @@ OM6DOF_DDGNG_COMMANDS = {
         OM6DOF_DDGNG_SERVICE,
     ),
 }
-
-
-def load_low_light_config(path: str = LOW_LIGHT_CONFIG_PATH) -> dict:
-    """Load a safe, user-owned setting shared by RealSense workloads."""
-    config = dict(LOW_LIGHT_DEFAULT)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            supplied = json.load(handle)
-        if isinstance(supplied, dict):
-            config["enabled"] = bool(supplied.get("enabled", config["enabled"]))
-            config["laser_power"] = float(supplied.get("laser_power", config["laser_power"]))
-            config["brightness_threshold"] = float(supplied.get("brightness_threshold", config["brightness_threshold"]))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
-    config["laser_power"] = max(0.0, min(360.0, config["laser_power"]))
-    config["brightness_threshold"] = max(0.0, min(255.0, config["brightness_threshold"]))
-    return config
-
-
-def save_low_light_config(enabled: bool, path: str = LOW_LIGHT_CONFIG_PATH) -> dict:
-    """Persist the toggle without accepting arbitrary values from HTTP."""
-    config = load_low_light_config(path)
-    config["enabled"] = bool(enabled)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-    return config
 
 # Unitree sport-mode API ids (verified against the official Unitree ROS2
 # ros2_sport_client.h / .cpp and go2w_cmd_vel_control_node.cpp).
@@ -440,34 +530,6 @@ def invoke_ddgng_service(
     )
 
 
-def restart_active_realsense_workloads(ssh_host: str = "") -> list:
-    """Restart only active camera owners so a changed IR setting is applied."""
-    restarted = []
-    for service, status in (
-        (OM6DOF_PERCEPTION_SERVICE, perception_service_status(ssh_host)),
-        (OM6DOF_DDGNG_SERVICE, ddgng_service_status(ssh_host)),
-    ):
-        if not status.get("active"):
-            continue
-        completed = subprocess.run(
-            _remote_command(ssh_host, [
-                "/usr/bin/systemctl", "--machine=kublab@", "--user",
-                "restart", service,
-            ]),
-            capture_output=True,
-            text=True,
-            timeout=12.0,
-            check=False,
-        )
-        if completed.returncode:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(
-                f"could not restart {service}: {detail or 'unknown error'}"
-            )
-        restarted.append(service)
-    return restarted
-
-
 def csrf_token_matches(provided: str, expected: str) -> bool:
     """Constant-time comparison that also safely rejects non-ASCII input."""
     try:
@@ -487,6 +549,7 @@ class MonitorNode(Node):
         super().__init__("go2w_web_monitor")
         self.flash = ""  # one-shot banner (e.g. kill result), shown then cleared
         self.csrf_token = secrets.token_urlsafe(32)
+        self.flight_stick = FlightStickMonitor()
         self._arm_restart_lock = threading.Lock()
         self._arm_restart_phase = "idle"
         self._arm_restart_message = ""
@@ -608,6 +671,14 @@ class MonitorNode(Node):
         self.pub_arm_target = self.create_publisher(
             String, "/om6dof/target_cmd", 10
         )
+        self.pub_airbus_gripper = self.create_publisher(
+            String, "/om6dof_teleop/gripper_cmd", 10
+        )
+        self.airbus_gripper_client = ActionClient(
+            self, GripperCommand, "/gripper_controller/gripper_cmd"
+        )
+        self._airbus_gripper_pressed = set()
+        self._airbus_rest_pressed = False
         self.pub_perception_target = self.create_publisher(
             String, "/om6dof_perception/set_target", 10
         )
@@ -1177,53 +1248,106 @@ class MonitorNode(Node):
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
-    def request_web_jog_dual(
-        self, mode: str, left_pair: int, left_x: float, left_y: float,
-        right_pair: int, right_x: float, right_y: float,
-    ) -> Tuple[bool, str]:
-        """Publish two independent joystick pairs as one bounded arm command."""
+    def request_airbus_jog(self, mode: str) -> Tuple[bool, str]:
+        """Map the connected TCA sidestick to one bounded OM6DOF velocity frame."""
         normalized = str(mode).strip().upper()
-        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
-            return False, "Joystick rejected: invalid operation mode."
-        try:
-            left_pair, right_pair = int(left_pair), int(right_pair)
-            left_x, left_y = float(left_x), float(left_y)
-            right_x, right_y = float(right_x), float(right_y)
-        except (TypeError, ValueError):
-            return False, "Joystick rejected: invalid joystick value."
-        values_to_check = (left_x, left_y, right_x, right_y)
-        if (left_pair not in (0, 1, 2) or right_pair not in (0, 1, 2)
-                or left_pair == right_pair or not all(
-                    math.isfinite(value) and -1.0 <= value <= 1.0
-                    for value in values_to_check)):
-            return False, "Joystick rejected: invalid dual-stick command."
+        if normalized not in ("CARTESIAN", "CYLINDRICAL"):
+            return False, "Airbus control requires CARTESIAN or CYLINDRICAL mode."
         with self._pickup_lock:
             if self.remote_enabled is not True:
-                return False, "Joystick rejected: enable streaming control first."
+                return False, "Airbus control rejected: enable streaming control first."
             if self.control_mode != normalized:
                 return False, (
-                    f"Joystick rejected: controller is in {self.control_mode or 'UNKNOWN'}, "
+                    f"Airbus control rejected: controller is in {self.control_mode or 'UNKNOWN'}, "
                     f"not {normalized}."
                 )
             if self.arm_target_active or self.pickup_busy:
-                return False, "Joystick rejected: an arm target or pickup is active."
+                return False, "Airbus control rejected: an arm target or pickup is active."
             if self.object_tracking_active or self.object_search_active:
-                return False, "Joystick rejected: tracking or search is active."
+                return False, "Airbus control rejected: tracking or search is active."
             if self._arm_restart_phase == "restarting":
-                return False, "Joystick rejected: the OM6DOF stack is restarting."
-        speed_pairs = {
-            "JOINT": ((0.25, 0.25), (0.25, 0.25), (0.25, 0.25)),
-            "CARTESIAN": ((0.03, 0.03), (0.03, 0.35), (0.35, 0.35)),
-            "CYLINDRICAL": ((0.025, 0.20), (0.025, 0.35), (0.35, 0.35)),
-        }
-        command = [0.0] * 6
-        for pair, x, y in ((left_pair, left_x, left_y),
-                           (right_pair, right_x, right_y)):
-            index = pair * 2
-            x_speed, y_speed = speed_pairs[normalized][pair]
-            command[index], command[index + 1] = x * x_speed, y * y_speed
-        self.pub_web_jog.publish(Float64MultiArray(data=command))
+                return False, "Airbus control rejected: the OM6DOF stack is restarting."
+        state = self.flight_stick.snapshot()
+        if not state["connected"]:
+            self._airbus_gripper_pressed.clear()
+            return False, "Airbus control rejected: flight stick is disconnected."
+        axes = list(state["axes"])
+        axes.extend([0.0] * max(0, 6 - len(axes)))
+        pressed = set(state["buttons"])
+        def deadzone(value: float) -> float:
+            return value if abs(value) >= 0.08 else 0.0
+        # User swap: Axis 1<->5 and Axis 2<->6.
+        # Preserve each robot-control direction while changing the input axis.
+        x = -deadzone(float(axes[5]))
+        y = -deadzone(float(axes[4]))
+        # Axis 3 remains roll; Axis 1 is now yaw; Axis 2 is now Z.
+        roll = deadzone(float(axes[2]))
+        yaw = deadzone(float(axes[0]))
+        # Axis 6 now provides analogue Z.  Buttons 1/2 provide pitch steps.
+        z = deadzone(float(axes[1]))
+        pitch = float((1 if 1 in pressed else 0) - (1 if 2 in pressed else 0))
+        # Axis 6=X, Axis 5=Y (or cylindrical theta), Axis 3=roll,
+        # Axis 1=yaw, Axis 2=Z; B1/B2 are pitch +/-; B3/B4 open/close.
+        if normalized == "CARTESIAN":
+            values = [x * 0.03, y * 0.03, z * 0.03,
+                      roll * 0.35, pitch * 0.35, yaw * 0.35]
+        else:
+            values = [x * 0.025, y * 0.20, z * 0.025,
+                      roll * 0.35, pitch * 0.35, yaw * 0.35]
+        self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
+
+    def request_airbus_gripper(self) -> Tuple[bool, str]:
+        """Hold Button 4 to grip; release it to open the gripper."""
+        state = self.flight_stick.snapshot()
+        if not state["connected"]:
+            self._airbus_gripper_pressed.clear()
+            return False, "Airbus gripper rejected: flight stick is disconnected."
+        pressed = set(state["buttons"])
+        was_gripping = 4 in self._airbus_gripper_pressed
+        is_gripping = 4 in pressed
+        self._airbus_gripper_pressed = {4} if is_gripping else set()
+        # Send exactly on the press/release edges: press grips, release opens.
+        command = "close" if is_gripping and not was_gripping else (
+            "open" if was_gripping and not is_gripping else ""
+        )
+        if not command:
+            return True, ""
+        if self.remote_enabled is not True:
+            return False, "Airbus gripper rejected: enable streaming control first."
+        if not self.airbus_gripper_client.server_is_ready():
+            return False, "Airbus gripper rejected: action server is unavailable."
+        goal = GripperCommand.Goal()
+        goal.command.position = 0.019 if command == "open" else -0.010
+        goal.command.max_effort = 0.0
+        self.airbus_gripper_client.send_goal_async(goal)
+        self.gripper_state = f"{command.upper()} requested from Airbus TCA"
+        return True, ""
+
+    def request_airbus_rest(self) -> Tuple[bool, str]:
+        """Toggle REST/READY from the Button 3 press edge."""
+        state = self.flight_stick.snapshot()
+        pressed = bool(state["connected"] and 3 in set(state["buttons"]))
+        was_pressed = self._airbus_rest_pressed
+        self._airbus_rest_pressed = pressed
+        if not pressed or was_pressed:
+            return True, ""
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, "REST/READY toggle rejected: enable streaming control first."
+            if self.control_mode not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+                return False, "REST/READY toggle rejected: wait for current motion to finish."
+            if self.arm_target_active or self.pickup_busy:
+                return False, "REST/READY toggle rejected: an arm target or pickup is active."
+            if self.object_tracking_active or self.object_tracking_busy:
+                return False, "REST/READY toggle rejected: tracking is active."
+            if self.object_search_active or self.object_search_busy:
+                return False, "REST/READY toggle rejected: search is active."
+            if self._arm_restart_phase == "restarting":
+                return False, "REST/READY toggle rejected: the stack is restarting."
+            self.rest_message = "REST/READY toggle requested from Airbus TCA."
+        self.set_operation_mode("TOGGLE_REST_READY")
+        return True, self.rest_message
 
     def request_arm_target(
         self, mode: str, values: List[float]
@@ -2401,222 +2525,425 @@ def route_agent(node: "MonitorNode", ollama_model: str, message: str
 
 
 CSS = """
-:root{color-scheme:dark}
-body{font-family:system-ui,sans-serif;margin:0;background:#12141a;color:#e6e6e6}
-header{position:sticky;top:0;z-index:900;background:#1c1f27;padding:14px 20px;
-  display:flex;align-items:center;justify-content:space-between;gap:12px;
-  flex-wrap:wrap;border-bottom:1px solid #2a2e39;box-shadow:0 5px 18px #0005}
-h1{font-size:18px;margin:0}
-.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;
-  flex-wrap:wrap}
-.theme-toggle{display:inline-flex;align-items:center;gap:7px;min-height:34px;padding:3px 8px 3px 4px;
-  background:linear-gradient(145deg,#30394a,#202633);color:#eaf0ff;border:1px solid #465269;
-  border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.01em;box-shadow:0 2px 8px #0004;
-  transition:background .2s ease,border-color .2s ease,box-shadow .2s ease,transform .2s ease}
-.theme-toggle:hover{background:linear-gradient(145deg,#3a465b,#272f3f);border-color:#71809d;box-shadow:0 4px 13px #0005;transform:translateY(-1px)}
-.theme-switch-track{position:relative;display:inline-flex;align-items:center;justify-content:space-between;width:42px;height:24px;
-  padding:2px;box-sizing:border-box;border-radius:999px;background:#111722;box-shadow:inset 0 1px 3px #0009}
-.theme-switch-icon{position:relative;z-index:1;width:18px;height:18px;opacity:.45;transition:opacity .2s ease}
-.theme-moon::before{content:"";position:absolute;left:4px;top:3px;width:10px;height:10px;border-radius:50%;background:#c8d6ee;box-shadow:inset -3px -1px 0 #63728a}
-.theme-sun::before{content:"";position:absolute;left:5px;top:5px;width:8px;height:8px;border-radius:50%;background:#f7c948;box-shadow:0 -4px 0 -3px #f7c948,0 4px 0 -3px #f7c948,4px 0 0 -3px #f7c948,-4px 0 0 -3px #f7c948}
-.theme-switch-thumb{position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:#9bb8ff;
-  box-shadow:0 1px 5px #0008;transition:transform .24s cubic-bezier(.2,.8,.2,1),background .2s ease}
-.theme-toggle[data-theme-mode="light"] .theme-switch-thumb{transform:translateX(18px);background:#ffd36a}
-.theme-toggle[data-theme-mode="dark"] .theme-moon,.theme-toggle[data-theme-mode="light"] .theme-sun{opacity:1}
-.theme-label{min-width:30px;text-align:left}
-:root[data-theme="light"]{color-scheme:light}
-:root[data-theme="light"] body{background:#f4f7fb;color:#182230}
-:root[data-theme="light"] header,:root[data-theme="light"] .card{background:#fff;border-color:#d9e1ec}
-:root[data-theme="light"] header{box-shadow:0 5px 18px #25344a18}
-:root[data-theme="light"] .header-clock,:root[data-theme="light"] .header-ram,:root[data-theme="light"] .header-battery,:root[data-theme="light"] .battery-icon,:root[data-theme="light"] .ram-chip,:root[data-theme="light"] .targetfield input,:root[data-theme="light"] .targetmode,:root[data-theme="light"] .chatrow input,:root[data-theme="light"] .chatrow select{background:#f7f9fc;color:#182230;border-color:#cbd5e1}
-:root[data-theme="light"] .header-clock,:root[data-theme="light"] .battery-percent,:root[data-theme="light"] .ram-percent{color:#182230}
-:root[data-theme="light"] .theme-toggle,:root[data-theme="light"] .btn.ghost,:root[data-theme="light"] .msg.ai,:root[data-theme="light"] .jogaxes button{background:#e8eef7;color:#182230}
-:root[data-theme="light"] .theme-toggle{background:linear-gradient(145deg,#fff,#e9f0f9);border-color:#c4d0df;color:#24344a;box-shadow:0 2px 8px #38506b26}
-:root[data-theme="light"] .theme-toggle:hover{background:linear-gradient(145deg,#fff,#dce8f5);border-color:#9eb1c9}
-:root[data-theme="light"] .theme-switch-track{background:#dce7f4;box-shadow:inset 0 1px 3px #7c91aa55}
-:root[data-theme="light"] .card h2,:root[data-theme="light"] td.k,:root[data-theme="light"] .ram-label,:root[data-theme="light"] .targetfield label,:root[data-theme="light"] .small,:root[data-theme="light"] .audiolevel,:root[data-theme="light"] .msg.hint{color:#536274}
-:root[data-theme="light"] td,:root[data-theme="light"] ul.nodes li{border-color:#e4eaf2}
-:root[data-theme="light"] .robotviz-wrap{border-color:#cbd5e1;background:radial-gradient(circle at 50% 35%,#edf3fb,#d7e2f0 72%)}
-:root[data-theme="light"] .webstick{border-color:#8fa3bf;background:radial-gradient(circle,#dce8f8 0 14%,#edf3fa 15% 100%);box-shadow:inset 0 0 0 22px #ffffff99}
-:root[data-theme="light"] .robotviz-joints{color:#536274}
-:root[data-theme="light"] .robotviz-joints span{color:#182230}
-.header-clock{display:inline-flex;align-items:center;min-height:26px;padding:4px 9px;
-  border:1px solid #343a48;border-radius:999px;background:#12141a;color:#f8fafc;
+/* ===================================================================
+   OM6DOF dashboard — light + dark, iris/graphite palette.
+
+   Theming contract (three states):
+     :root                                   -> complete LIGHT palette
+     @media(dark) :root:not([data-theme=light]) -> dark, for system default
+     :root[data-theme="dark"]                -> dark, for the manual toggle
+   No colour is ever defined only inside a media/[data-theme] block, so
+   every state resolves.
+
+   Deliberately cheap to render: no backdrop-filter, no
+   background-attachment:fixed, no gradients — those cause scroll jank
+   on the Jetson's browser.
+   =================================================================== */
+
+:root{
+  color-scheme:light;
+  --bg:#f5f5f7;
+  --surface:#ffffff;
+  --surface-2:#f0f0f3;
+  --surface-3:#e4e4e9;
+  --line:#e2e2e7;
+  --line-2:#c9cad2;
+  --text:#1c2024;
+  --text-2:#60646c;
+  --text-3:#8b8d98;
+  --accent:#5b5bd6;
+  --accent-solid:#5b5bd6;
+  --accent-hover:#5151cd;
+  --accent-fg:#ffffff;
+  --ok-fg:#218358;
+  --ok-bg:rgba(48,164,108,.14);
+  --warn-fg:#ab6400;
+  --warn-bg:rgba(255,178,36,.20);
+  --bad-fg:#ce2c31;
+  --bad-bg:rgba(229,72,77,.12);
+  --shadow:0 1px 2px rgba(0,0,0,.04),0 10px 26px -14px rgba(0,0,0,.18);
+  /* the 3D viewport keeps its own dark canvas in both themes */
+  --viz-bg:#101520;
+  --viz-fg:#c9d4e4;
+  --r-card:18px;
+  --r-btn:980px;
+  --r-in:12px;
+}
+@media(prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0c0c0e;
+    --surface:#161619;
+    --surface-2:#1f1f23;
+    --surface-3:#2a2a31;
+    --line:rgba(255,255,255,.09);
+    --line-2:rgba(255,255,255,.17);
+    --text:#eeeef0;
+    --text-2:#b0b4ba;
+    --text-3:#82848c;
+    --accent:#7c7ce8;
+    --accent-solid:#5b5bd6;
+    --accent-hover:#6e6ade;
+    --accent-fg:#ffffff;
+    --ok-fg:#3dd68c;
+    --ok-bg:rgba(61,214,140,.15);
+    --warn-fg:#ffca16;
+    --warn-bg:rgba(255,202,22,.15);
+    --bad-fg:#ff6369;
+    --bad-bg:rgba(255,99,105,.15);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 26px -14px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0c0c0e;
+  --surface:#161619;
+  --surface-2:#1f1f23;
+  --surface-3:#2a2a31;
+  --line:rgba(255,255,255,.09);
+  --line-2:rgba(255,255,255,.17);
+  --text:#eeeef0;
+  --text-2:#b0b4ba;
+  --text-3:#82848c;
+  --accent:#7c7ce8;
+  --accent-solid:#5b5bd6;
+  --accent-hover:#6e6ade;
+  --accent-fg:#ffffff;
+  --ok-fg:#3dd68c;
+  --ok-bg:rgba(61,214,140,.15);
+  --warn-fg:#ffca16;
+  --warn-bg:rgba(255,202,22,.15);
+  --bad-fg:#ff6369;
+  --bad-bg:rgba(255,99,105,.15);
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 26px -14px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  font-size:15px;line-height:1.47;letter-spacing:-.01em;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ---------- header ---------- */
+header{
+  position:sticky;top:0;z-index:900;background:var(--bg);
+  border-bottom:1px solid var(--line);
+  padding:13px 24px;display:flex;align-items:center;justify-content:space-between;
+  gap:14px;flex-wrap:wrap;
+}
+h1{font-size:19px;line-height:1.25;margin:0;font-weight:600;letter-spacing:-.02em;
+  display:flex;align-items:center;gap:9px}
+.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;flex-wrap:wrap}
+.header-clock,.header-ram,.header-battery{
+  display:inline-flex;align-items:center;min-height:32px;border-radius:var(--r-btn);
+  background:var(--surface);
+}
+.header-clock{padding:5px 13px;color:var(--text);
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;
-  font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.02em}
-.header-ram,.header-battery{display:flex;align-items:center;padding:5px 10px 5px 9px;
-  border:1px solid #343a48;border-radius:999px;background:#12141a;
-  box-shadow:inset 0 1px 0 #ffffff0a}
+  font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:0}
+.header-ram,.header-battery{padding:5px 13px 5px 12px}
 .header-ram{cursor:help}
-.header-ram .ram-gauge{gap:7px;min-height:20px}
+.header-ram .ram-gauge,.header-battery .battery-gauge{gap:8px;min-height:20px}
 .header-ram .ram-chip{width:30px;height:16px}
-.header-ram .ram-percent{font-size:13px}
-.header-battery .battery-gauge{gap:7px;min-height:20px}
 .header-battery .battery-icon{width:34px;height:16px;border-radius:4px}
 .header-battery .battery-icon::after{height:8px}
-.header-battery .battery-percent{font-size:13px}
+.header-ram .ram-percent,.header-battery .battery-percent{font-size:14px}
+.theme-toggle{min-width:38px;padding:9px 13px;font-size:15px;line-height:1}
 @media(max-width:640px){
-  header{padding:10px 12px;gap:8px}
-  h1{font-size:15px}
-  .header-actions{gap:5px}
+  header{padding:10px 14px;gap:8px}
+  h1{font-size:16px}
+  .header-actions{gap:6px}
   .header-actions .btn.ghost{display:none}
-  .header-actions button{padding:7px 10px;font-size:12px}
-  .header-ram,.header-battery{padding:4px 9px 4px 8px}
+  .header-actions button{padding:7px 14px;font-size:13px}
+  .header-actions button.theme-toggle{display:inline-block;padding:7px 11px}
+  .header-ram,.header-battery{padding:4px 10px 4px 9px}
 }
-main{padding:16px;max-width:1100px;margin:0 auto}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.camera-control-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(320px,.75fr);
-  gap:16px;align-items:start}
-.camera-control-grid .joystick-column{position:sticky;top:92px}
-@media(max-width:800px){
-  .grid,.camera-control-grid{grid-template-columns:1fr}
-  .camera-control-grid .joystick-column{position:static}
+
+/* ---------- layout ---------- */
+main{padding:32px 24px 64px;max-width:1480px;margin:0 auto}
+@media(max-width:640px){main{padding:20px 14px 44px}}
+/* Sections chunk 12 cards into 5 labelled groups ordered by the real
+   operating sequence, so the page has a scannable outline instead of a
+   flat wall of equally loud panels. */
+.sec{margin:0 0 52px}
+.sec:last-child{margin-bottom:0}
+.sec-h{font-size:26px;font-weight:600;letter-spacing:-.022em;line-height:1.2;
+  margin:0 0 5px;color:var(--text)}
+.sec-sub{margin:0 0 20px;color:var(--text-3);font-size:14.5px;max-width:70ch}
+.sec-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));
+  gap:22px;align-items:start}
+@media(max-width:520px){
+  .sec{margin-bottom:38px}
+  .sec-h{font-size:22px}
+  .sec-grid{grid-template-columns:1fr;gap:16px}
 }
-.mobile-main{max-width:680px;padding:12px;margin:0 auto}
-.mobile-header{position:sticky;top:0;z-index:950;background:#1c1f27;padding:10px 12px;
-  display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid #2a2e39}
-.mobile-header h1{font-size:16px}.mobile-header .pill{white-space:nowrap}
-.mobile-grid{display:grid;gap:10px}.mobile-card{margin:0;padding:12px}
-.mobile-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
-.mobile-actions button{width:100%;min-height:52px;font-size:14px;font-weight:700}
-.mobile-actions .wide{grid-column:1/-1}.mobile-mode{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
-.mobile-mode button{min-height:42px;font-size:12px}.mobile-status{display:grid;grid-template-columns:1fr 1fr;gap:7px;font-size:13px}
-.mobile-status div{padding:8px;border:1px solid #2a2e39;border-radius:7px;background:#161923}.mobile-status b{display:block;color:#9aa4b2;font-size:11px;margin-bottom:3px}
-.mobile-main .webjog{grid-template-columns:1fr;justify-items:center}.mobile-main .webstick{width:min(72vw,270px);height:min(72vw,270px)}
-.mobile-main .webjog>div:last-child{width:100%}.mobile-main .jogaxes{grid-template-columns:repeat(3,minmax(0,1fr))}
-.mobile-main .robotviz-wrap{height:245px}.mobile-main .cam{max-height:42vh;object-fit:cover}
-@media(min-width:681px){.mobile-main .webjog{grid-template-columns:270px 1fr;justify-items:initial}.mobile-main .webstick{width:250px;height:250px}}
-.game-page{overflow:hidden;background:#05080e}.game-shell{position:fixed;inset:0;background:#070b13}
-.game-camera{position:absolute;inset:0;background:radial-gradient(circle at 50% 35%,#182535,#070b13 75%)}
-.game-camera img{width:100%;height:100%;object-fit:cover;display:none}.game-vignette{position:absolute;inset:0;pointer-events:none;background:linear-gradient(#05080e99,transparent 28%,transparent 70%,#05080ecc)}
-.game-top{position:absolute;inset:calc(env(safe-area-inset-top) + 10px) 12px auto;z-index:10;display:flex;justify-content:space-between;gap:8px;pointer-events:none}.game-chip{pointer-events:auto;padding:7px 10px;border:1px solid #7c91ad77;border-radius:10px;background:#0b1220c9;backdrop-filter:blur(10px);font-size:12px}.game-mini{position:absolute;left:12px;top:62px;z-index:11;width:132px;height:132px;border:1px solid #8ca6c488;border-radius:14px;background:#0b1220d9;backdrop-filter:blur(10px);overflow:hidden}.game-mini canvas{width:100%;height:100%;display:block}.game-mini .robotviz-badge{font-size:9px;left:5px;top:5px}.game-mode{position:absolute;top:62px;right:12px;z-index:11;width:142px;background:#0b1220d9;border:1px solid #8ca6c488;border-radius:10px;color:#fff;padding:9px;backdrop-filter:blur(10px)}
-.game-stick{position:absolute;bottom:calc(env(safe-area-inset-bottom) + 18px);z-index:12;width:142px;height:142px;border-radius:50%;border:1px solid #b9d0ed77;background:radial-gradient(circle,#7aa2d433 0 20%,#0b1422a8 21% 100%);box-shadow:inset 0 0 0 18px #ffffff0a,0 8px 28px #0008;touch-action:none}.game-stick::before,.game-stick::after{content:"";position:absolute;background:#b9d0ed44}.game-stick::before{left:50%;top:9px;bottom:9px;width:1px}.game-stick::after{top:50%;left:9px;right:9px;height:1px}.game-stick.left{left:18px}.game-stick.right{right:18px}.game-knob{position:absolute;left:50%;top:50%;width:52px;height:52px;border-radius:50%;transform:translate(-50%,-50%);background:radial-gradient(circle at 35% 30%,#d7ecff,#4b8ecc);box-shadow:0 4px 16px #0009;border:1px solid #e9f6ff99}.game-stick.disabled{opacity:.4;filter:grayscale(.9)}.game-label{position:absolute;bottom:-23px;width:100%;text-align:center;font-size:11px;color:#d8e9ff;text-shadow:0 1px 3px #000}.game-actions{position:absolute;z-index:13;left:50%;bottom:calc(env(safe-area-inset-bottom) + 12px);transform:translateX(-50%);display:flex;gap:7px}.game-actions button{min-height:40px;padding:8px 11px;background:#0b1220dc;border:1px solid #7c91ad88;backdrop-filter:blur(10px);font-size:11px}.game-actions .stop{background:#7f1d1dcc}.game-help{position:absolute;z-index:11;left:50%;top:calc(env(safe-area-inset-top) + 14px);transform:translateX(-50%);font-size:11px;color:#cad8ea;text-align:center;pointer-events:none}.game-menu{position:absolute;right:12px;bottom:calc(env(safe-area-inset-bottom) + 178px);z-index:12;width:158px;display:grid;gap:6px}.game-menu button{min-height:35px;background:#0b1220dc;border:1px solid #7c91ad88;font-size:11px}.game-status{position:absolute;left:12px;bottom:calc(env(safe-area-inset-bottom) + 178px);z-index:12;font-size:11px;color:#d8e9ff;background:#0b1220c9;padding:7px 9px;border-radius:8px;backdrop-filter:blur(10px)}
-.card{background:#1c1f27;border:1px solid #2a2e39;border-radius:10px;padding:14px;
-  margin-bottom:16px}
-.card h2{font-size:14px;margin:0 0 10px;color:#9aa4b2;text-transform:uppercase;
-  letter-spacing:.05em}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td{padding:4px 6px;border-bottom:1px solid #23262f;vertical-align:top}
-td.k{color:#9aa4b2;width:42%}
-.pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;
-  font-weight:600}
-.ok{background:#123d2b;color:#4ade80}
-.bad{background:#3d1620;color:#f87171}
-.warn{background:#3d3416;color:#fbbf24}
-.battery-gauge{display:inline-flex;align-items:center;gap:9px;min-height:26px;
-  color:#6b7280}
-.battery-icon{position:relative;display:inline-block;width:42px;height:20px;
-  padding:2px;box-sizing:border-box;border:2px solid currentColor;border-radius:5px;
-  background:#12141a}
-.battery-icon::after{content:"";position:absolute;top:50%;right:-6px;width:4px;
-  height:10px;transform:translateY(-50%);border-radius:0 2px 2px 0;
-  background:currentColor}
+/* legacy containers, kept working if the template still emits them */
+.dash{display:grid;grid-template-columns:minmax(0,1.34fr) minmax(340px,.66fr);
+  gap:22px;align-items:start}
+.dash-col{min-width:0;display:flex;flex-direction:column;gap:22px}
+@media(max-width:1024px){.dash{grid-template-columns:1fr}}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}
+.camera-control-grid{display:grid;grid-template-columns:minmax(0,1.34fr) minmax(340px,.66fr);
+  gap:22px;align-items:start}
+@media(max-width:1024px){.grid,.camera-control-grid{grid-template-columns:1fr}}
+
+/* ---------- cards ---------- */
+.card{background:var(--surface);border-radius:var(--r-card);padding:26px 26px 24px;
+  box-shadow:var(--shadow)}
+.dash-col>.card{margin-bottom:0}
+.card+.card{margin-top:22px}
+.dash-col .card+.card{margin-top:0}
+@media(max-width:640px){.card{padding:20px 18px}}
+/* card titles sit one level below the section title, in size and in markup */
+.card-h{
+  display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+  font-size:17px;font-weight:600;letter-spacing:-.015em;line-height:1.3;
+  margin:0 0 16px;color:var(--text);text-transform:none;
+}
+
+/* ---------- tables ---------- */
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:11px 0;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.k{color:var(--text-3);width:44%;font-weight:400;padding-right:14px}
+
+/* ---------- status pills ---------- */
+.pill{
+  display:inline-flex;align-items:center;gap:7px;padding:3px 12px;
+  border-radius:var(--r-btn);font-size:13px;font-weight:500;line-height:1.6;
+  background:var(--surface-2);color:var(--text-2);
+}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;
+  background:currentColor;flex:none}
+.ok{background:var(--ok-bg);color:var(--ok-fg)}
+.warn{background:var(--warn-bg);color:var(--warn-fg)}
+.bad{background:var(--bad-bg);color:var(--bad-fg)}
+
+/* ---------- gauges ---------- */
+.battery-gauge,.ram-gauge{display:inline-flex;align-items:center;gap:9px;
+  min-height:26px;color:var(--text-3)}
+.battery-icon{position:relative;display:inline-block;width:42px;height:20px;padding:2px;
+  border:1.5px solid currentColor;border-radius:5px;background:transparent}
+.battery-icon::after{content:"";position:absolute;top:50%;right:-5px;width:3px;height:9px;
+  transform:translateY(-50%);border-radius:0 2px 2px 0;background:currentColor}
 .battery-fill{display:block;height:100%;border-radius:2px;background:currentColor;
   transition:width .35s ease}
-.battery-percent{min-width:3.4ch;color:#e6e6e6;font-size:15px;font-weight:700;
-  font-variant-numeric:tabular-nums}
-.battery-good{color:#4ade80}
-.battery-medium{color:#fbbf24}
-.battery-low{color:#f87171}
-.battery-unknown{color:#6b7280}
-.ram-gauge{display:inline-flex;align-items:center;gap:9px;min-height:26px;
-  color:#6b7280}
+.battery-percent,.ram-percent{min-width:3.4ch;color:var(--text);font-size:16px;
+  font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.battery-good,.ram-good{color:var(--ok-fg)}
+.battery-medium,.ram-medium{color:var(--warn-fg)}
+.battery-low,.ram-high{color:var(--bad-fg)}
+.battery-unknown,.ram-unknown{color:var(--text-3)}
 .ram-chip{position:relative;display:inline-block;width:38px;height:20px;padding:3px;
-  box-sizing:border-box;border:2px solid currentColor;border-radius:4px;
-  background:#12141a}
-.ram-chip::before,.ram-chip::after{content:"";position:absolute;top:2px;width:3px;
-  height:2px;background:currentColor;box-shadow:0 5px 0 currentColor,
-  0 10px 0 currentColor}
+  border:1.5px solid currentColor;border-radius:4px;background:transparent}
+.ram-chip::before,.ram-chip::after{content:"";position:absolute;top:2px;width:3px;height:2px;
+  background:currentColor;box-shadow:0 5px 0 currentColor,0 10px 0 currentColor}
 .ram-chip::before{left:-5px}
 .ram-chip::after{right:-5px}
 .ram-fill{display:block;height:100%;border-radius:1px;background:currentColor;
   transition:width .35s ease}
-.ram-reading{display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap}
-.ram-label{color:#a8b0c0;font-size:11px;font-weight:700;letter-spacing:.04em}
-.ram-percent{min-width:3.4ch;color:#e6e6e6;font-size:15px;font-weight:700;
-  font-variant-numeric:tabular-nums}
-.ram-good{color:#4ade80}
-.ram-medium{color:#fbbf24}
-.ram-high{color:#f87171}
-.ram-unknown{color:#6b7280}
-.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
-.dup{background:#3d1620;color:#f87171;font-weight:700}
-button,.btn{background:#2b64f5;color:#fff;border:0;padding:9px 16px;border-radius:8px;
-  font-size:14px;cursor:pointer;text-decoration:none;display:inline-block}
-button.stop{background:#c0392b}
-button:disabled{opacity:.55;cursor:not-allowed}
-.btn.ghost{background:#2a2e39}
-img.cam{width:100%;border-radius:8px;background:#000;min-height:220px}
-.audioctl{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.audioctl button.live{background:#c0392b}
-.audiolevel{color:#8b93a2;font-size:12px}
-.small{color:#6b7280;font-size:12px}
-ul.nodes{list-style:none;padding:0;margin:0;font-size:13px}
-ul.nodes li{padding:3px 6px;border-bottom:1px solid #23262f;display:flex;
-  align-items:center;justify-content:space-between;gap:8px}
-button.kill{background:#7a2531;color:#f3b0b7;border:0;padding:2px 10px;
-  border-radius:6px;font-size:11px;cursor:pointer}
-button.kill:hover{background:#c0392b;color:#fff}
-.flash{background:#123d2b;color:#7ee2a8;border:1px solid #1c5c40;
-  border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
-.actionnotice{position:fixed;top:72px;right:18px;z-index:1000;max-width:min(440px,calc(100vw - 36px));
-  padding:11px 14px;border-radius:9px;border:1px solid #3158a8;background:#17233d;
-  color:#dbeafe;box-shadow:0 10px 30px #0008;font-size:13px;line-height:1.4;
-  opacity:0;transform:translateY(-8px);pointer-events:none;transition:.18s ease}
-.actionnotice.show{opacity:1;transform:translateY(0)}
-.actionnotice.ok{background:#123d2b;border-color:#1c7550;color:#9af0ba}
-.actionnotice.warn{background:#3d3416;border-color:#80691a;color:#fde68a}
-.actionnotice.bad{background:#451c25;border-color:#943443;color:#fecdd3}
-button[data-ajax-busy="1"]{opacity:.65;cursor:progress}
+.ram-reading{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+.ram-label{color:var(--text-3);font-size:12px;font-weight:500}
+
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
+  color:var(--text-2);letter-spacing:0}
+.dup{background:var(--bad-bg);color:var(--bad-fg);font-weight:600}
+.small{color:var(--text-3);font-size:13px;line-height:1.6}
+
+/* ---------- buttons: styled by CONSEQUENCE, not decoration ----------
+   b-primary  the main positive action of a card
+   b-neutral  ordinary, no physical effect
+   b-stop     halts something already running — deliberately NOT red
+   b-caution  the robot will physically move
+   b-danger   destructive; red is reserved for these alone, so red keeps
+              its meaning instead of being background noise. */
+button,.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  background:var(--surface-2);color:var(--text);border:1px solid transparent;
+  padding:9px 18px;border-radius:var(--r-btn);
+  font-family:inherit;font-size:14px;font-weight:500;letter-spacing:-.01em;
+  line-height:1.45;cursor:pointer;text-decoration:none;
+  transition:background .18s ease,border-color .18s ease,color .18s ease,opacity .18s ease;
+}
+button:hover:not(:disabled),.btn:hover{background:var(--surface-3)}
+button:focus-visible,.btn:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+button:disabled{opacity:.4;cursor:not-allowed}
+
+.b-primary{background:var(--accent-solid);color:var(--accent-fg);border-color:transparent}
+.b-primary:hover:not(:disabled){background:var(--accent-hover)}
+.b-neutral{background:var(--surface-2);color:var(--text);border-color:var(--line)}
+.b-neutral:hover:not(:disabled){background:var(--surface-3)}
+.b-stop{background:transparent;color:var(--text-2);border-color:var(--line-2)}
+.b-stop:hover:not(:disabled){background:var(--surface-2);color:var(--text)}
+.b-caution{background:transparent;color:var(--warn-fg);border-color:var(--warn-fg)}
+.b-caution:hover:not(:disabled){background:var(--warn-bg)}
+.b-danger,button.kill{background:transparent;color:var(--bad-fg);border-color:var(--bad-fg)}
+.b-danger:hover:not(:disabled),button.kill:hover:not(:disabled){
+  background:var(--bad-fg);color:#fff;border-color:var(--bad-fg)}
+
+.btn.ghost,button.ghost{background:var(--surface-2);color:var(--text)}
+.btn.ghost:hover,button.ghost:hover:not(:disabled){background:var(--surface-3)}
+button[data-ajax-busy="1"]{opacity:.55;cursor:progress}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;align-items:center}
 .inline{display:inline;margin:0}
-.chatcard{border-color:#2b64f5;box-shadow:0 0 0 1px #2b64f533}
-.chatcard h2{color:#7ea1ff}
-.btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-.targetgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;
-  margin:10px 0}
-.targetfield{display:flex;flex-direction:column;gap:4px;min-width:0}
-.targetfield label{font-size:11px;color:#a8b0c0}
-.targetfield input,.targetmode{box-sizing:border-box;width:100%;background:#12141a;
-  border:1px solid #2a2e39;color:#e6e6e6;padding:8px;border-radius:7px;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-@media(max-width:560px){.targetgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ---------- media ---------- */
+img.cam{width:100%;border-radius:14px;background:#000;min-height:220px;display:block}
+.audioctl{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+/* "live" marks an ACTIVE stream, which is a state, not a hazard —
+   so it reads as accent-on, not red. */
+.audioctl button.live{background:var(--accent-solid);color:var(--accent-fg);
+  border-color:transparent}
+.audiolevel{color:var(--text-3);font-size:13px}
+
+ul.nodes{list-style:none;padding:0;margin:0;font-size:14px}
+ul.nodes li{padding:9px 0;border-bottom:1px solid var(--line);display:flex;
+  align-items:center;justify-content:space-between;gap:10px}
+ul.nodes li:last-child{border-bottom:0}
+
+.flash{background:var(--ok-bg);color:var(--ok-fg);border-radius:14px;
+  padding:14px 18px;margin-bottom:22px;font-size:14px}
+.actionnotice{position:fixed;top:78px;right:20px;z-index:1000;
+  max-width:min(420px,calc(100vw - 40px));padding:14px 18px;border-radius:14px;
+  background:var(--surface);color:var(--text);font-size:14px;line-height:1.45;
+  box-shadow:0 8px 30px -8px rgba(0,0,0,.35);border:1px solid var(--line);
+  opacity:0;transform:translateY(-6px);pointer-events:none;transition:.2s ease}
+.actionnotice.show{opacity:1;transform:translateY(0)}
+.actionnotice.ok{background:var(--ok-bg);color:var(--ok-fg);border-color:transparent}
+.actionnotice.warn{background:var(--warn-bg);color:var(--warn-fg);border-color:transparent}
+.actionnotice.bad{background:var(--bad-bg);color:var(--bad-fg);border-color:transparent}
+
+/* ---------- chat ---------- */
+.chatcard .card-h{color:var(--text)}
 .chatlog{min-height:180px;max-height:44vh;overflow-y:auto;display:flex;
-  flex-direction:column;gap:8px;padding:6px 2px;margin-bottom:10px}
-.msg.hint{background:transparent;color:#8b93a2;font-size:12px;max-width:100%;
-  align-self:stretch;padding-left:0}
-.msg{padding:8px 11px;border-radius:10px;font-size:13px;max-width:88%;white-space:pre-wrap;
-  word-wrap:break-word;overflow-wrap:anywhere;line-height:1.45}
-.msg.user{align-self:flex-end;background:#2b64f5;color:#fff;border-bottom-right-radius:3px}
-.msg.ai{align-self:flex-start;background:#2a2e39;color:#e6e6e6;border-bottom-left-radius:3px}
-.chatrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.chatrow input{flex:1;min-width:150px;background:#12141a;border:1px solid #2a2e39;
-  color:#e6e6e6;padding:9px 11px;border-radius:8px;font-size:14px}
-.chatrow select{background:#12141a;border:1px solid #2a2e39;color:#e6e6e6;
-  padding:9px;border-radius:8px;font-size:13px}
-.webjog{display:grid;grid-template-columns:minmax(190px,250px) 1fr;gap:14px;align-items:center}
+  flex-direction:column;gap:10px;padding:2px;margin-bottom:14px}
+.msg{padding:10px 15px;border-radius:18px;font-size:14px;max-width:86%;
+  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;line-height:1.45}
+.msg.user{align-self:flex-end;background:var(--accent-solid);color:var(--accent-fg);
+  border-bottom-right-radius:5px}
+.msg.ai{align-self:flex-start;background:var(--surface-2);color:var(--text);
+  border-bottom-left-radius:5px}
+.msg.hint{background:transparent;color:var(--text-3);font-size:13px;max-width:100%;
+  align-self:stretch;padding:0}
+.chatrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.chatrow input{flex:1;min-width:150px;font-family:inherit;font-size:15px}
+
+/* ---------- inputs ---------- */
+.targetgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0}
+.targetfield{display:flex;flex-direction:column;gap:6px;min-width:0}
+.targetfield label{font-size:13px;color:var(--text-3)}
+.targetfield input,.targetmode,.chatrow input,.chatrow select{
+  width:100%;background:var(--surface-2);border:1px solid var(--line);color:var(--text);
+  padding:10px 13px;border-radius:var(--r-in);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;
+  transition:border-color .2s ease}
+.chatrow select{width:auto;font-family:inherit}
+.targetfield input:focus,.targetmode:focus,.chatrow input:focus,.chatrow select:focus{
+  outline:0;border-color:var(--accent)}
+@media(max-width:560px){.targetgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ---------- web joystick ---------- */
+.webjog{display:grid;grid-template-columns:minmax(180px,220px) 1fr;gap:20px;align-items:center}
 .webstick{width:190px;height:190px;max-width:100%;aspect-ratio:1;position:relative;
-  border-radius:50%;border:2px solid #3b4d71;background:radial-gradient(circle,#24314b 0 14%,#151b28 15% 100%);
-  touch-action:none;user-select:none;cursor:grab;box-shadow:inset 0 0 0 22px #0d101899}
-.webstick:active{cursor:grabbing}.webstick.disabled{opacity:.45;cursor:not-allowed}
-.webstick::before,.webstick::after{content:"";position:absolute;background:#5d6b82;opacity:.6}
-.webstick::before{width:1px;height:100%;left:50%;top:0}.webstick::after{height:1px;width:100%;top:50%;left:0}
-.webstick-knob{position:absolute;width:54px;height:54px;left:50%;top:50%;transform:translate(-50%,-50%);
-  border-radius:50%;background:#2b64f5;border:2px solid #a9c0ff;box-shadow:0 4px 16px #0009;pointer-events:none}
-.jogaxes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
-.jogaxes button{padding:8px;font-size:12px;background:#2a2e39}.jogaxes button.selected{background:#2b64f5}
-.jogreadout{min-height:1.3em;margin-top:8px}.jogwarning{color:#fbbf24}
-@media(max-width:560px){.webjog{grid-template-columns:1fr}.webstick{margin:auto}.jogaxes{grid-template-columns:1fr}}
-.robotviz-wrap{position:relative;height:330px;border:1px solid #2a2e39;border-radius:8px;
-  overflow:hidden;background:radial-gradient(circle at 50% 35%,#202b3d,#0d1017 72%)}
+  border-radius:50%;background:var(--surface-2);touch-action:none;user-select:none;cursor:grab}
+.webstick:active{cursor:grabbing}
+.webstick.disabled{opacity:.4;cursor:not-allowed}
+.webstick::before,.webstick::after{content:"";position:absolute;background:var(--line-2)}
+.webstick::before{width:1px;height:100%;left:50%;top:0}
+.webstick::after{height:1px;width:100%;top:50%;left:0}
+.webstick-knob{position:absolute;width:52px;height:52px;left:50%;top:50%;
+  transform:translate(-50%,-50%);border-radius:50%;background:var(--accent-solid);
+  pointer-events:none}
+.jogaxes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+.jogaxes button{padding:9px 6px;font-size:13px;background:var(--surface-2);color:var(--text)}
+.jogaxes button:hover:not(:disabled){background:var(--surface-3)}
+.jogaxes button.selected{background:var(--accent-solid);color:var(--accent-fg)}
+.jogreadout{min-height:1.3em;margin-top:12px}
+.jogwarning{color:var(--warn-fg)}
+@media(max-width:560px){.webjog{grid-template-columns:1fr}.webstick{margin:auto}
+  .jogaxes{grid-template-columns:1fr}}
+
+/* ---------- flight stick ----------
+   Analog stage and button map are separate blocks: nothing is stacked
+   on top of anything else, so nothing can be clipped. Knob travel comes
+   from --x/--y/--yaw/--v (unitless -1..1 set by JS); CSS owns geometry. */
+.flightstick-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,.6fr);
+  gap:18px;align-items:start}
+@media(max-width:560px){.flightstick-layout{grid-template-columns:1fr}}
+.fs-stage{display:grid;grid-template-columns:minmax(0,1fr) 46px;gap:16px;
+  align-items:center;padding:32px 20px 22px;border-radius:16px;background:var(--surface-2)}
+.fs-analog{position:relative;width:100%;max-width:200px;aspect-ratio:1;margin:0 auto}
+.fs-yaw{position:absolute;inset:0;border-radius:50%;border:3px solid var(--line-2);
+  border-top-color:var(--warn-fg);border-right-color:var(--warn-fg);
+  transform:rotate(calc(var(--yaw,0) * 135deg));transition:transform .09s linear}
+.fs-yaw-label{position:absolute;left:50%;top:-8px;transform:translate(-50%,-100%);
+  color:var(--warn-fg);font:600 11px ui-monospace,monospace}
+.fs-big{position:absolute;inset:13%;border-radius:50%;background:var(--surface)}
+.fs-big::before,.fs-big::after,.fs-small::before,.fs-small::after{
+  content:"";position:absolute;background:var(--line-2)}
+.fs-big::before{left:50%;top:10px;bottom:10px;width:1px}
+.fs-big::after{top:50%;left:10px;right:10px;height:1px}
+.fs-small{position:absolute;left:50%;top:50%;width:44%;height:44%;
+  transform:translate(-50%,-50%);border:1.5px solid var(--ok-fg);border-radius:50%}
+.fs-small::before{left:50%;top:6px;bottom:6px;width:1px}
+.fs-small::after{top:50%;left:6px;right:6px;height:1px}
+.fs-knob{position:absolute;left:50%;top:50%;border-radius:50%;
+  transform:translate(calc(-50% + var(--x,0) * var(--r)),
+                      calc(-50% + var(--y,0) * var(--r)));
+  transition:transform .09s linear}
+.fs-big>.fs-knob{--r:34px;width:38px;height:38px;background:var(--accent-solid)}
+.fs-small>.fs-knob{--r:11px;width:19px;height:19px;background:var(--ok-fg)}
+.fs-axislabels{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
+  display:flex;justify-content:space-between;padding:0 14px;color:var(--text-3);
+  font:600 11px ui-monospace,monospace;pointer-events:none}
+.fs-axislabels i{font-style:normal}
+.fs-small-label{position:absolute;left:50%;bottom:-18px;transform:translateX(-50%);
+  color:var(--ok-fg);font:600 10px ui-monospace,monospace;white-space:nowrap}
+.fs-lift{position:relative;height:186px;border-radius:24px;background:var(--surface)}
+.fs-lift-label{position:absolute;left:50%;top:-8px;transform:translate(-50%,-100%);
+  color:var(--accent);font:600 11px ui-monospace,monospace}
+.fs-lift-track{position:absolute;left:50%;top:14px;bottom:14px;width:1px;
+  transform:translateX(-50%);background:var(--line-2)}
+.fs-lift-knob{position:absolute;left:50%;top:50%;width:28px;height:28px;border-radius:50%;
+  background:var(--accent-solid);transform:translate(-50%,calc(-50% + var(--v,0) * 72px));
+  transition:transform .09s linear}
+/* .flightstick-axis rows are generated by JS — keep the class name */
+.flightstick-readout{border-radius:16px;background:var(--surface-2);padding:18px}
+.flightstick-readout h4{margin:0 0 12px;font-size:15px;font-weight:600;
+  letter-spacing:-.01em;color:var(--text);text-transform:none}
+.flightstick-axis{display:flex;justify-content:space-between;gap:10px;padding:7px 0;
+  border-bottom:1px solid var(--line);font-size:13px;color:var(--text-3)}
+.flightstick-axis:last-of-type{border-bottom:0}
+.flightstick-axis strong{color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-weight:500;font-variant-numeric:tabular-nums}
+.flightstick-legend{margin:14px 0 0;color:var(--text-3);font-size:13px;line-height:1.6}
+.fs-buttons{display:grid;grid-template-columns:repeat(auto-fit,minmax(44px,1fr));
+  gap:8px;margin-top:18px}
+.fs-btn{display:flex;align-items:center;justify-content:center;min-height:36px;
+  border-radius:10px;background:var(--surface-2);color:var(--text-3);
+  font:500 13px ui-monospace,SFMono-Regular,Menlo,monospace;
+  transition:background .15s ease,color .15s ease}
+.fs-btn.down{background:var(--accent-solid);color:var(--accent-fg)}
+
+/* ---------- robot visualizer ----------
+   The canvas paints its own dark scene, so this viewport stays dark in
+   both themes and its overlay text is pinned to a light colour. */
+.robotviz-wrap{position:relative;height:340px;border-radius:16px;overflow:hidden;
+  background:var(--viz-bg)}
 .robotviz-wrap canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
 .robotviz-wrap canvas:active{cursor:grabbing}
-.robotviz-badge{position:absolute;left:10px;top:10px;pointer-events:none}
-.robotviz-help{position:absolute;right:10px;top:10px;color:#738096;font-size:11px;
-  pointer-events:none;text-align:right}
-.robotviz-joints{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px 10px;
-  margin-top:10px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#a8b0c0}
-.robotviz-joints span{color:#e6e6e6;text-align:right;font-variant-numeric:tabular-nums}
-@media(max-width:420px){.robotviz-wrap{height:280px}.robotviz-joints{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.robotviz-badge{position:absolute;left:14px;top:14px;pointer-events:none}
+.robotviz-help{position:absolute;right:14px;top:14px;color:var(--viz-fg);opacity:.75;
+  font-size:12px;pointer-events:none;text-align:right;line-height:1.6}
+.robotviz-joints{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px 16px;
+  margin-top:18px;font-size:13px;color:var(--text-3)}
+.robotviz-joints span{color:var(--text);text-align:right;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+@media(max-width:420px){.robotviz-wrap{height:280px}
+  .robotviz-joints{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
 
@@ -2624,8 +2951,6 @@ button[data-ajax-busy="1"]{opacity:.65;cursor:progress}
 # escaping; interpolated into the page template as {SCRIPTS}.
 SCRIPTS = """
 <script>
-(function(){try{const saved=localStorage.getItem('om6dof-monitor-theme');const theme=saved==='light'||saved==='dark'?saved:(window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');document.documentElement.dataset.theme=theme;}catch(_e){}})();
-function setupThemeToggle(){const button=document.getElementById('theme_toggle');if(!button)return;const apply=(theme)=>{document.documentElement.dataset.theme=theme;button.dataset.themeMode=theme;const label=button.querySelector('.theme-label');if(label)label.textContent=theme==='dark'?'Dark':'Light';button.setAttribute('aria-pressed',String(theme==='light'));button.setAttribute('aria-label','Switch to '+(theme==='dark'?'light':'dark')+' mode');};apply(document.documentElement.dataset.theme==='light'?'light':'dark');button.addEventListener('click',()=>{const next=document.documentElement.dataset.theme==='light'?'dark':'light';try{localStorage.setItem('om6dof-monitor-theme',next);}catch(_e){}apply(next);});}
 let statusPollRunning=false;
 const armTargetSchemas={
   JOINT:[['Joint 1','rad'],['Joint 2','rad'],['Joint 3','rad'],
@@ -2676,27 +3001,22 @@ function updateArmTargetSchema(fillCurrent=true){
   if(fillCurrent) fillArmTargetFromCurrent();
 }
 
-let webJogPair=0,webJogHeld=false,webJogX=0,webJogY=0,webJogTimer=null,webJogAllowed=false;
+let webJogPair=0,webJogHeld=false,webJogX=0,webJogY=0,webJogTimer=null,webJogAllowed=false,armControlMode='';
 const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 5','Joint 6']],CARTESIAN:[['X','Y'],['Z','Roll'],['Pitch','Yaw']],CYLINDRICAL:[['Radius','Theta'],['Z','Roll'],['Pitch','Yaw']]};
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
-function updateWebJogAvailability(d){webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed);const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.';if(!webJogAllowed&&webJogHeld)releaseWebJog()}
+function controlSource(){return document.getElementById('control_source')?.value||'web'}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=controlSource()==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
-function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode');if(!stick||!mode)return;mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};stick.onpointerdown=e=>{if(!webJogAllowed)return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
-
-// Game-style mobile controls. Both sticks are combined into one six-axis
-// command so they cannot overwrite one another on the ROS control topic.
-const gameJog={left:{pair:0,x:0,y:0,held:false},right:{pair:1,x:0,y:0,held:false},allowed:false,timer:null};
-function gameMode(){return document.getElementById('game_mode')?.value||'JOINT'}
-function setGameKnob(side){const s=gameJog[side],knob=document.getElementById('game_'+side+'_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(s.x*43)+'px),calc(-50% + '+(-s.y*43)+'px))'}
-function releaseGameStick(side){const s=gameJog[side];s.held=false;s.x=0;s.y=0;setGameKnob(side);if(!gameJog.left.held&&!gameJog.right.held&&gameJog.timer){clearInterval(gameJog.timer);gameJog.timer=null;sendGameJog(true)}}
-function updateGameStick(side,event){const stick=document.getElementById('game_'+side);if(!stick)return;const rect=stick.getBoundingClientRect(),radius=Math.min(rect.width,rect.height)*.34;let x=(event.clientX-(rect.left+rect.width/2))/radius,y=-(event.clientY-(rect.top+rect.height/2))/radius,length=Math.hypot(x,y);if(length>1){x/=length;y/=length}gameJog[side].x=x;gameJog[side].y=y;setGameKnob(side)}
-async function sendGameJog(zero=false){if(!zero&&!gameJog.allowed)return;const left=gameJog.left,right=gameJog.right,body=new URLSearchParams({csrf:document.getElementById('game_controls')?.dataset.csrf||'',mode:gameMode(),left_pair:String(left.pair),left_x:String(zero?0:left.x),left_y:String(zero?0:left.y),right_pair:String(right.pair),right_x:String(zero?0:right.x),right_y:String(zero?0:right.y)});try{const r=await fetch('/web_jog_dual',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseGameStick('left');releaseGameStick('right')}}catch(_e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseGameStick('left');releaseGameStick('right')}}}
-function updateGameJogAvailability(d){gameJog.allowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;for(const side of ['left','right']){const stick=document.getElementById('game_'+side);if(stick)stick.classList.toggle('disabled',!gameJog.allowed)}const status=document.getElementById('game_status');if(status)status.textContent=gameJog.allowed?'HOLD STICK TO MOVE':'ENABLE CONTROL TO ARM';if(!gameJog.allowed){releaseGameStick('left');releaseGameStick('right')}}
-function setupGamePads(){const mode=document.getElementById('game_mode');if(!mode)return;mode.onchange=()=>{releaseGameStick('left');releaseGameStick('right')};for(const side of ['left','right']){const stick=document.getElementById('game_'+side);if(!stick)continue;stick.onpointerdown=e=>{if(!gameJog.allowed)return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);gameJog[side].held=true;updateGameStick(side,e);sendGameJog();if(!gameJog.timer)gameJog.timer=setInterval(sendGameJog,40)};stick.onpointermove=e=>{if(gameJog[side].held)updateGameStick(side,e)};['pointerup','pointercancel','lostpointercapture'].forEach(name=>stick.addEventListener(name,()=>releaseGameStick(side)));}window.addEventListener('blur',()=>{releaseGameStick('left');releaseGameStick('right')});window.addEventListener('pagehide',()=>{releaseGameStick('left');releaseGameStick('right')});updateGameJogAvailability({})}
+function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
+function renderFlightAnalog(a){const axis=i=>Math.max(-1,Math.min(1,Number(a[i]||0)));const set=(id,prop,val)=>{const el=document.getElementById(id);if(el)el.style.setProperty(prop,val)};set('flight_stick_big_knob','--x',axis(0));set('flight_stick_big_knob','--y',axis(1));set('flight_stick_small_knob','--x',axis(4));set('flight_stick_small_knob','--y',axis(5));set('flight_stick_yaw','--yaw',axis(2));set('flight_stick_lift_knob','--v',axis(3))}
+async function sendAirbusJog(){if(controlSource()!=='airbus'||!webJogAllowed)return;const mode=armControlMode;if(!['CARTESIAN','CYLINDRICAL'].includes(mode))return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode});try{const r=await fetch('/airbus_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus joystick command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus joystick connection lost.','bad',6000)}}
+async function sendAirbusGripper(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_gripper',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus gripper command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus gripper connection lost.','bad',6000)}}
+async function sendAirbusRest(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_rest',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Rest-position request rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus rest-position connection lost.','bad',6000)}}
+async function pollFlightStick(){const card=document.getElementById('flight_stick');if(!card)return;try{const r=await fetch('/flight_stick.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderFlightAnalog(d.axes||[]);sendAirbusJog();sendAirbusGripper();sendAirbusRest();const device=document.getElementById('flight_stick_device'),event=document.getElementById('flight_stick_event'),axes=document.getElementById('flight_stick_axes');if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No joystick detected in /dev/input/js*';if(event)event.textContent=d.last_event||'';document.querySelectorAll('#flight_stick [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));if(axes){axes.replaceChildren(...(d.axes||[]).map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>Axis '+(i+1)+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}}catch(_error){const device=document.getElementById('flight_stick_device');if(device)device.textContent='Flight-stick monitor unavailable';}}
 
 // Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
 // om6dof_description/urdf/om6dof.urdf.xacro; values come from measured
@@ -2804,7 +3124,6 @@ async function pollStatus(){
         || !['JOINT','CARTESIAN','CYLINDRICAL'].includes(d.control_mode_value);
     }
     updateWebJogAvailability(d);
-    updateGameJogAvailability(d);
     const cameraCard=document.getElementById('camera_card');
     const cameraImage=document.getElementById('camera_image');
     if(cameraCard && cameraImage && d.camera_available!==undefined){
@@ -2839,11 +3158,11 @@ async function pollStatus(){
       if(d.ddgng_camera_available){
         ddgngCameraImage.style.display='block';
         if(!ddgngCameraImage.getAttribute('src')) ddgngCameraImage.src='/ddgng.mjpg?'+Date.now();
-        if(ddgngCameraStatus) ddgngCameraStatus.textContent='DD-GNG 3D segmentation stream active.';
+        if(ddgngCameraStatus) ddgngCameraStatus.textContent='DD-GNG YOLO semantic stream active.';
       }else{
         ddgngCameraImage.style.display='none';
         ddgngCameraImage.removeAttribute('src');
-        if(ddgngCameraStatus) ddgngCameraStatus.textContent='Waiting for DD-GNG 3D segmentation. Press Start 3D segmentation.';
+        if(ddgngCameraStatus) ddgngCameraStatus.textContent='Waiting for DD-GNG YOLO. Press Start DD-GNG YOLO.';
       }
     }
     const audioCard=document.getElementById('audio_card');
@@ -2919,6 +3238,7 @@ async function submitControlForm(form,submitter){
   if(form.dataset.ajaxBusy==='1') return;
   const button=submitter || form.querySelector('button[type="submit"],input[type="submit"]');
   const originalText=button ? button.textContent : '';
+  const originalDisabled=button ? button.disabled : false;
   form.dataset.ajaxBusy='1';
   form.setAttribute('aria-busy','true');
   if(button){
@@ -2965,6 +3285,7 @@ async function submitControlForm(form,submitter){
     form.removeAttribute('aria-busy');
     if(button){
       delete button.dataset.ajaxBusy;
+      button.disabled=originalDisabled;
       button.textContent=originalText;
     }
     refreshStatusBurst();
@@ -3112,9 +3433,9 @@ document.addEventListener('DOMContentLoaded',function(){
   const useCurrent=document.getElementById('arm_target_use_current');
   if(useCurrent) useCurrent.addEventListener('click',fillArmTargetFromCurrent);
   updateArmTargetSchema(false);
-  setupThemeToggle();
   setupWebJog();
-  setupGamePads();
+  pollFlightStick();
+  setInterval(pollFlightStick,100);
 });
 </script>
 """
@@ -3424,107 +3745,6 @@ def status_fields(node, cam=None, audio=None) -> dict:
     }
 
 
-def render_mobile_page(
-        node: MonitorNode, cam: ForwardedImageStream,
-        audio: Optional[ForwardedPcmStream] = None) -> str:
-    """Phone-first arm control page; it reuses the same guarded HTTP actions."""
-    fields = status_fields(node, cam, audio)
-    csrf = html.escape(node.csrf_token, quote=True)
-    mobile_joystick = f"""
-    <div class="card mobile-card" id="web_jog" data-csrf="{csrf}">
-      <h2>🕹️ Hold-to-move joystick</h2>
-      <div class="webjog">
-        <div class="webstick disabled" id="web_stick" role="application"
-             aria-label="Hold and drag to move the selected robot axes">
-          <div class="webstick-knob" id="web_stick_knob"></div>
-        </div>
-        <div>
-          <label class="small" for="web_jog_mode">Command mode</label>
-          <select class="targetmode" id="web_jog_mode">
-            <option value="JOINT">JOINT</option>
-            <option value="CARTESIAN">CARTESIAN</option>
-            <option value="CYLINDRICAL">CYLINDRICAL</option>
-          </select>
-          <div class="jogaxes" id="web_jog_axes"></div>
-          <p class="mono jogreadout" id="web_jog_readout">Enable control first.</p>
-        </div>
-      </div>
-      <p class="small jogwarning">Hold the joystick to move. Releasing it or
-      losing the connection sends a zero command within 0.3 seconds.</p>
-    </div>
-    """
-    robot_viz = """
-    <div class="card mobile-card" id="robot_visualizer_card">
-      <h2>🦾 Live TF pose</h2>
-      <div class="robotviz-wrap"><canvas id="robot_visualizer"
-      aria-label="Live OM6DOF TF visualization"></canvas>
-      <span class="robotviz-badge pill warn" id="robotviz_status">WAITING</span></div>
-      <p class="small">Drag to rotate. Red/green/blue arrows are X/Y/Z TF axes.</p>
-    </div>
-    """
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#1c1f27"><title>OM6DOF Mobile Control</title>
-<style>{CSS}</style></head><body>
-<header class="mobile-header"><h1>🦾 Mobile Arm Control</h1>
-<span id="st_arm_stack">{fields['arm_stack']}</span>
-<a class="btn ghost" href="/">Desktop</a></header>
-<main class="mobile-main"><div id="action_notice" class="actionnotice" aria-live="polite"></div>
-<div class="mobile-grid">
-  <div class="card mobile-card"><h2>Safety and ownership</h2>
-    <div class="mobile-status"><div><b>Control</b><span id="st_teleop">{fields['teleop']}</span></div>
-    <div><b>Torque</b><span id="st_torque_state">{fields['torque_state']}</span></div>
-    <div><b>Mode</b><span id="st_control_mode">{fields['control_mode']}</span></div>
-    <div><b>Arm bus</b><span id="st_arm_bus">{fields['arm_bus']}</span></div></div>
-  </div>
-  <div class="card mobile-card"><h2>Control mode</h2><div class="mobile-mode">
-    <form method="POST" action="/mode_joint"><button type="submit">JOINT</button></form>
-    <form method="POST" action="/mode_cartesian"><button type="submit">CARTESIAN</button></form>
-    <form method="POST" action="/mode_cylindrical"><button type="submit">CYLINDRICAL</button></form>
-  </div></div>
-  <div class="mobile-actions">
-    <form method="POST" action="/mode_joint"><button type="submit">▶ Enable control</button></form>
-    <form method="POST" action="/mode_autonomous"><button class="stop" type="submit">■ Stop control</button></form>
-    <form method="POST" action="/rest_position" onsubmit="return confirm('Move the arm to its captured rest position? Keep the workspace clear.')"><input type="hidden" name="csrf" value="{csrf}"><button class="wide ghost" type="submit">↩ Back to rest position</button></form>
-    <form method="POST" action="/disable_torque" onsubmit="return confirm('Disable torque? Support the arm before continuing.')"><input type="hidden" name="csrf" value="{csrf}"><button class="wide kill" id="disable_torque_btn" type="submit">⚠ Disable torque</button></form>
-  </div>
-  {mobile_joystick}
-  <div class="card mobile-card" id="perception_camera_card"><h2>📷 RealSense camera</h2>
-    <img class="cam" id="perception_camera_image" style="display:none" alt="RealSense perception stream">
-    <p id="perception_camera_status">Waiting for RealSense perception.</p>
-    <div class="mobile-actions"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">▶ Start perception</button></form>
-    <form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button class="stop" id="stop_perception_btn" type="submit">■ Stop perception</button></form></div>
-  </div>
-  {robot_viz}
-</div></main>{SCRIPTS}</body></html>"""
-
-
-def render_game_mobile_page(
-        node: MonitorNode, cam: ForwardedImageStream,
-        audio: Optional[ForwardedPcmStream] = None) -> str:
-    """Fullscreen game-inspired two-stick page for phones."""
-    fields = status_fields(node, cam, audio)
-    csrf = html.escape(node.csrf_token, quote=True)
-    low_light = load_low_light_config()
-    low_light_action = "disable" if low_light["enabled"] else "enable"
-    low_light_button = "Low-light off" if low_light["enabled"] else "Low-light"
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<meta name="theme-color" content="#070b13"><title>OM6DOF Game Control</title>
-<style>{CSS}</style></head><body class="game-page"><main class="game-shell" id="game_controls" data-csrf="{csrf}">
-  <div class="game-camera" id="perception_camera_card"><img id="perception_camera_image" alt="RealSense camera"><div class="game-vignette"></div></div>
-  <div class="game-top"><span class="game-chip">🦾 <span id="st_arm_stack">{fields['arm_stack']}</span></span><a class="game-chip" href="/">Desktop</a></div>
-  <div class="game-help">Two-stick arm control · release either stick to stop that pair</div>
-  <div class="game-mini"><canvas id="robot_visualizer" aria-label="Live TF mini map"></canvas><span class="robotviz-badge pill warn" id="robotviz_status">WAITING</span></div>
-  <select class="game-mode" id="game_mode" aria-label="Arm command mode"><option value="JOINT">JOINT</option><option value="CARTESIAN">CARTESIAN</option><option value="CYLINDRICAL">CYLINDRICAL</option></select>
-  <div class="game-status" id="game_status">ENABLE CONTROL TO ARM<br><span id="st_control_mode">{fields['control_mode']}</span> · <span id="st_torque_state">{fields['torque_state']}</span></div>
-  <div class="game-stick left disabled" id="game_left"><div class="game-knob" id="game_left_knob"></div><span class="game-label">PAIR 1 · axes 1 / 2</span></div>
-  <div class="game-stick right disabled" id="game_right"><div class="game-knob" id="game_right_knob"></div><span class="game-label">PAIR 2 · axes 3 / 4</span></div>
-  <div class="game-menu"><form method="POST" action="/start_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="start_perception_btn" type="submit">Start camera</button></form><form method="POST" action="/stop_perception"><input type="hidden" name="csrf" value="{csrf}"><button id="stop_perception_btn" type="submit">Stop camera</button></form><form method="POST" action="/set_low_light"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{low_light_action}"><button type="submit">{low_light_button}</button></form></div>
-  <div class="game-actions"><form method="POST" action="/mode_joint"><button type="submit">▶ Enable</button></form><form method="POST" action="/mode_autonomous"><button class="stop" type="submit">■ Stop</button></form><form method="POST" action="/rest_position" onsubmit="return confirm('Move the arm to rest position? Keep the workspace clear.')"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">↩ Rest</button></form></div>
-</main>{SCRIPTS}</body></html>"""
-
-
 def render_page(
         node: MonitorNode,
         cam: ForwardedImageStream,
@@ -3560,7 +3780,7 @@ def render_page(
             ("Gripper", fields["gripper"], "gripper"),
             ("OM6DOF stack", fields["arm_stack"], "arm_stack"),
             ("OM6DOF perception", fields["perception"], "perception"),
-            ("OM6DOF DD-GNG 3D segmentation", fields["ddgng"], "ddgng"),
+            ("OM6DOF DD-GNG YOLO", fields["ddgng"], "ddgng"),
         ])
     if go2w_enabled:
         rows.extend([
@@ -3644,14 +3864,14 @@ def render_page(
     )
     ddgng_cam_html = f"""
     <div class="card" id="ddgng_camera_card">
-      <h2>🕸️ OM6DOF DD-GNG 3D segmentation preview</h2>
+      <h2>🕸️ OM6DOF DD-GNG YOLO preview</h2>
       <img class="cam" id="ddgng_camera_image"{ddgng_cam_src}
            style="display:{ddgng_img_display}"
            alt="OM6DOF DD-GNG RealSense stream">
       <p id="ddgng_camera_status">{
-          "DD-GNG 3D segmentation stream active."
+          "DD-GNG YOLO semantic stream active."
           if ddgng_camera_available
-          else "Waiting for DD-GNG 3D segmentation. Press Start 3D segmentation."
+          else "Waiting for DD-GNG YOLO. Press Start DD-GNG YOLO."
       }</p>
       <p class="small">ROS input:
       <span class="mono">{ddgng_cam_topic}</span>. DD-GNG and perception take
@@ -3790,9 +4010,18 @@ def render_page(
     <div class="card">
       <h2>🦾 OM6DOF arm ownership</h2>
       <p>Status: {pill(teleop_on, "STREAMING ENABLED", "AUTONOMOUS")}</p>
+      <label class="small" for="control_source">Control source</label>
+      <select class="targetmode" id="control_source">
+        <option value="web">Web analog (default)</option>
+        <option value="airbus">Airbus TCA analog</option>
+      </select>
       <div class="btnrow">
         <form class="inline" method="POST" action="/mode_joint">
           <button type="submit">▶ Enable JOINT control</button>
+        </form>
+        <form class="inline" method="POST" action="/mode_ready"
+              onsubmit="return confirm('Move the arm through zero to the READY position? Keep the workspace clear.')">
+          <button type="submit">Go to READY position</button>
         </form>
         <form class="inline" method="POST" action="/mode_autonomous">
           <button class="stop" type="submit">■ Return to AUTONOMOUS</button>
@@ -3843,6 +4072,38 @@ def render_page(
       <p class="small jogwarning">Hold-to-move only. Release the stick to stop.
       The dashboard sends velocity commands at 25 Hz and the controller watchdog
       stops stale commands after 0.3 s. Keep the workspace clear.</p>
+    </div>
+    """
+
+    flight_stick_html = """
+    <div class="card" id="flight_stick">
+      <h2>🕹️ Flight stick input</h2>
+      <p class="small" id="flight_stick_device">Scanning /dev/input/js*…</p>
+      <p class="mono" id="flight_stick_event">No button event yet</p>
+      <div class="flightstick-layout">
+        <div class="fs-stage">
+          <div class="fs-analog" aria-label="Large XY and yaw axes with nested small XY axes">
+            <div class="fs-yaw" id="flight_stick_yaw"></div>
+            <span class="fs-yaw-label">YAW</span>
+            <div class="fs-big">
+              <span class="fs-axislabels"><i>X</i><i>Y</i></span>
+              <span class="fs-knob" id="flight_stick_big_knob"></span>
+              <div class="fs-small">
+                <span class="fs-knob" id="flight_stick_small_knob"></span>
+                <span class="fs-small-label">SMALL X / Y</span>
+              </div>
+            </div>
+          </div>
+          <div class="fs-lift" aria-label="Lift axis">
+            <span class="fs-lift-label">LIFT</span>
+            <span class="fs-lift-track"></span>
+            <span class="fs-lift-knob" id="flight_stick_lift_knob"></span>
+          </div>
+        </div>
+        <div class="flightstick-readout"><h4>Axis live</h4><div id="flight_stick_axes">No axes</div><p class="flightstick-legend">Blue = pressed<br>Button numbers follow Linux joystick order.</p></div>
+      </div>
+      <div class="fs-buttons"><span class="fs-btn" data-btn="1">1</span><span class="fs-btn" data-btn="2">2</span><span class="fs-btn" data-btn="3">3</span><span class="fs-btn" data-btn="4">4</span><span class="fs-btn" data-btn="5">5</span><span class="fs-btn" data-btn="6">6</span><span class="fs-btn" data-btn="7">7</span><span class="fs-btn" data-btn="8">8</span><span class="fs-btn" data-btn="9">9</span><span class="fs-btn" data-btn="10">10</span><span class="fs-btn" data-btn="11">11</span><span class="fs-btn" data-btn="12">12</span><span class="fs-btn" data-btn="13">13</span><span class="fs-btn" data-btn="14">14</span><span class="fs-btn" data-btn="15">15</span><span class="fs-btn" data-btn="16">16</span><span class="fs-btn" data-btn="17">17</span></div>
+      <p class="small">Pressed buttons turn blue. This is monitor-only: it does not send robot commands.</p>
     </div>
     """
 
@@ -4064,44 +4325,22 @@ def render_page(
     ddgng_active = fields["ddgng_active"]
     ddgng_html = f"""
     <div class="card">
-      <h2>🕸️ OM6DOF DD-GNG 3D segmentation</h2>
+      <h2>🕸️ OM6DOF DD-GNG YOLO</h2>
       <p>Status: <span id="ddgng_card">{fields["ddgng"]}</span></p>
       <div class="btnrow">
         <form class="inline" method="POST" action="/start_ddgng">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button id="start_ddgng_btn" type="submit"{" disabled" if ddgng_active else ""}>▶ Start 3D segmentation</button>
+          <button id="start_ddgng_btn" type="submit"{" disabled" if ddgng_active else ""}>▶ Start DD-GNG YOLO</button>
         </form>
         <form class="inline" method="POST" action="/stop_ddgng">
           <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-          <button class="stop" id="stop_ddgng_btn" type="submit"{"" if ddgng_active else " disabled"}>■ Stop 3D segmentation</button>
+          <button class="stop" id="stop_ddgng_btn" type="submit"{"" if ddgng_active else " disabled"}>■ Stop DD-GNG YOLO</button>
         </form>
       </div>
-      <p class="small">Runs DD-GNG with YOLO object names and RealSense depth
-      segmentation. Each detection becomes a camera-frame 3D bounding box; only
-      DD-GNG nodes inside that box receive the object label. The overlay shows
-      box size and distance. Systemd stops perception/pickup when this starts
-      so two processes do not open the camera at the same time.</p>
-    </div>
-    """
-    low_light = load_low_light_config()
-    low_light_state = "ON" if low_light["enabled"] else "OFF"
-    low_light_action = "disable" if low_light["enabled"] else "enable"
-    low_light_button = (
-        "Disable low-light mode" if low_light["enabled"] else "Enable low-light mode"
-    )
-    low_light_html = f"""
-    <div class="card">
-      <h2>🌙 RealSense low-light mode</h2>
-      <p>Status: <strong>{low_light_state}</strong></p>
-      <form class="inline" method="POST" action="/set_low_light">
-        <input type="hidden" name="csrf" value="{html.escape(node.csrf_token, quote=True)}">
-        <input type="hidden" name="action" value="{low_light_action}">
-        <button type="submit">{low_light_button}</button>
-      </form>
-      <p class="small">When enabled, the active RealSense workload is restarted
-      with the available device low-light setting (IR emitter/laser when supported,
-      otherwise auto exposure). YOLO object names still require visible
-      light, so use a small white LED if labels are needed.</p>
+      <p class="small">Runs DD-GNG + YOLO headlessly, assigns semantic labels
+      to nodes that intersect detections, and sends the RealSense overlay to the
+      web UI. Systemd stops perception/pickup when DD-GNG starts so two
+      processes do not open the camera at the same time.</p>
     </div>
     """
 
@@ -4160,19 +4399,45 @@ def render_page(
         else "Go2W" if go2w_enabled
         else "OM6DOF"
     )
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    status_card_html = (
+        '<div class="card"><h2>📊 Robot status '
+        '<span class="small" id="st_dot">●</span></h2>'
+        f'<table>{status_rows}</table></div>'
+    )
+    om = om6dof_enabled
+    sections_html = render_sections([
+        ("Overview", "Live health of the robot and the monitor.",
+         [status_card_html]),
+        ("Robot Agent", "Natural-language command channel.",
+         [chat_html]),
+        ("Live view", "What the cameras and the mapper currently see.",
+         [cam_html,
+          perception_cam_html if om else "",
+          ddgng_cam_html if om else ""]),
+        ("Arm control",
+         "Power the arm, claim it, then move it — the controls follow that order.",
+         [arm_service_html if om else "",
+          teleop_html if om else "",
+          web_jog_html if om else "",
+          robot_visualizer_html if om else "",
+          arm_target_html if om else ""]),
+        ("Perception &amp; mapping", "Object detection, tracking and graph mapping.",
+         [perception_html if om else "", ddgng_html if om else ""]),
+        ("Audio &amp; input devices",
+         "Microphone pipeline and connected input hardware.",
+         [audio_html, flight_stick_html]),
+    ])
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{monitor_label} Monitor — {html.escape(info['hostname'])}</title>
-<style>{CSS}</style></head><body>
+<style>{CSS}</style>
+<script>(function(){{try{{var t=localStorage.getItem('om6dof-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}}catch(e){{}}}})();</script></head><body>
 <header><h1>{"🤖 " if go2w_enabled else "🦾 "}{monitor_label} Monitor</h1>
 <div class="header-actions">
 <time class="header-clock" id="header_clock" aria-label="Local time">--:--</time>
 <div class="header-ram" id="st_ram">{fields["ram"]}</div>
 {f'<div class="header-battery" id="st_battery">{fields["battery"]}</div>' if go2w_enabled else ''}
-<button class="theme-toggle" id="theme_toggle" type="button" aria-pressed="false" aria-label="Switch theme">
-  <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span><span class="theme-switch-icon theme-moon"></span><span class="theme-switch-icon theme-sun"></span></span><span class="theme-label">Dark</span>
-</button>
-<a class="btn ghost" href="/mobile">📱 Mobile control</a>
+<button class="theme-toggle" id="theme_toggle" type="button" aria-label="Switch theme">☾</button>
 <a class="btn ghost" href="/">↻ Refresh</a>
 <form class="inline" method="POST" action="/restart"
       onsubmit="return confirm('Restart the web monitor service? The page will reconnect in a few seconds.')">
@@ -4191,36 +4456,166 @@ Snapshot {now}.</p>
 {flash_html}
 {dup_banner}
 {chat_html}
-<div class="camera-control-grid">
-  <div class="camera-column">
-    {cam_html}
-    {perception_cam_html if om6dof_enabled else ""}
-    {ddgng_cam_html if om6dof_enabled else ""}
-  </div>
-  <div class="joystick-column">
-    {web_jog_html if om6dof_enabled else ""}
-    {robot_visualizer_html if om6dof_enabled else ""}
-  </div>
-</div>
-<div class="grid">
-  <div>
-    <div class="card"><h2>📊 Robot status <span class="small" id="st_dot">●</span></h2>
-      <table>{status_rows}</table></div>
-    {arm_service_html if om6dof_enabled else ""}
-    {perception_html if om6dof_enabled else ""}
-    {ddgng_html if om6dof_enabled else ""}
-    {low_light_html if om6dof_enabled else ""}
-  </div>
-  <div>
-    {teleop_html if om6dof_enabled else ""}
-    {arm_target_html if om6dof_enabled else ""}
-    {audio_html}
-  </div>
-</div>
+{sections_html}
 </main>
 {SCRIPTS}
+{THEME_SCRIPT}
 </body></html>"""
+    return style_action_buttons(page)
 
+
+
+# --------------------------------------------------------------------------- #
+#  Presentation helpers                                                       #
+# --------------------------------------------------------------------------- #
+# Buttons are styled by CONSEQUENCE rather than decoration, and the mapping
+# lives in one auditable place. It is keyed on element id first -- ids are
+# stable and the client JS already depends on them -- and on the form action
+# second, so renaming a visible label can never silently downgrade a
+# destructive control into an ordinary-looking one.
+#
+#   b-primary  main positive action        b-caution  the robot will move
+#   b-neutral  no physical effect          b-danger   destructive
+#   b-stop     halts something running (deliberately not red, so that red
+#              keeps meaning "destructive" instead of becoming background noise)
+BUTTON_CLASS_BY_ID = {
+    "enable_torque_btn": "b-primary",
+    "disable_torque_btn": "b-danger",
+    "restart_om6dof_btn": "b-danger",
+    "pickup_object_btn": "b-caution",
+    "rest_position_btn": "b-caution",
+    "send_arm_target_btn": "b-caution",
+    "stop_arm_target_btn": "b-stop",
+    "arm_target_use_current": "b-neutral",
+    "start_object_tracking_btn": "b-primary",
+    "stop_object_tracking_btn": "b-stop",
+    "start_object_search_btn": "b-primary",
+    "stop_object_search_btn": "b-stop",
+    "start_perception_btn": "b-primary",
+    "stop_perception_btn": "b-stop",
+    "start_ddgng_btn": "b-primary",
+    "stop_ddgng_btn": "b-stop",
+    "start_audio_pipeline_btn": "b-primary",
+    "stop_audio_pipeline_btn": "b-stop",
+    "audio_toggle": "b-neutral",
+    "chatsend": "b-primary",
+    "theme_toggle": "b-neutral",
+}
+
+BUTTON_CLASS_BY_ACTION = {
+    "/restart": "b-danger",
+    "/shutdown": "b-danger",
+    "/restart_om6dof": "b-danger",
+    "/disable_torque": "b-danger",
+    "/enable_torque": "b-primary",
+    "/mode_joint": "b-primary",
+    "/mode_ready": "b-caution",
+    "/rest_position": "b-caution",
+    "/arm_target": "b-caution",
+    "/mode_autonomous": "b-stop",
+    "/arm_target_stop": "b-stop",
+    "/stop_llm": "b-stop",
+    "/mode_cartesian": "b-neutral",
+    "/mode_cylindrical": "b-neutral",
+    "/target_perception": "b-neutral",
+}
+
+# legacy presentational classes replaced by the consequence class
+_LEGACY_BUTTON_CLASSES = {"stop", "kill", "ghost"}
+_MARKUP_TOKEN = re.compile(r"<form\b[^>]*>|</form>|<button\b[^>]*>", re.I)
+
+
+def style_action_buttons(page: str) -> str:
+    """Tag every button with the class matching what pressing it does."""
+    out = []
+    pos = 0
+    action = None
+    for match in _MARKUP_TOKEN.finditer(page):
+        out.append(page[pos:match.start()])
+        pos = match.end()
+        tag = match.group(0)
+        lowered = tag.lower()
+        if lowered.startswith("</form"):
+            action = None
+            out.append(tag)
+            continue
+        if lowered.startswith("<form"):
+            found = re.search(r'action="([^"]+)"', tag)
+            action = found.group(1).split("?")[0] if found else None
+            out.append(tag)
+            continue
+        found = re.search(r'id="([^"]+)"', tag)
+        css_class = BUTTON_CLASS_BY_ID.get(found.group(1)) if found else None
+        if css_class is None and action:
+            css_class = BUTTON_CLASS_BY_ACTION.get(action)
+        if css_class:
+            existing = re.search(r'class="([^"]*)"', tag)
+            if existing:
+                kept = [c for c in existing.group(1).split()
+                        if c not in _LEGACY_BUTTON_CLASSES]
+                kept.append(css_class)
+                tag = tag[:existing.start()] + 'class="%s"' % " ".join(kept) \
+                    + tag[existing.end():]
+            else:
+                tag = tag[:-1].rstrip() + ' class="%s">' % css_class
+        out.append(tag)
+    out.append(page[pos:])
+    return "".join(out)
+
+
+def render_sections(sections) -> str:
+    """Group cards into labelled sections ordered by the operating sequence.
+
+    Twelve equally weighted cards give the eye no entry point; chunking them
+    under headings turns scanning into recognition. Card titles are demoted
+    from h2 to h3 so the page keeps one clean outline: h1 page, h2 section,
+    h3 card. Empty sections disappear on their own, which is what keeps the
+    Go2W-disabled layout tidy.
+    """
+    rendered = []
+    for title, subtitle, cards in sections:
+        body = "\n".join(card for card in cards if card and card.strip())
+        if not body:
+            continue
+        body = body.replace("<h2>", '<h3 class="card-h">').replace("</h2>", "</h3>")
+        rendered.append(
+            '<section class="sec">\n<h2 class="sec-h">%s</h2>\n'
+            '<p class="sec-sub">%s</p>\n<div class="sec-grid">\n%s\n</div>\n</section>'
+            % (title, subtitle, body)
+        )
+    return "\n".join(rendered)
+
+
+THEME_SCRIPT = """<script>
+(function(){
+  var KEY='om6dof-theme',root=document.documentElement;
+  var btn=document.getElementById('theme_toggle');
+  if(!btn) return;
+  function effective(){
+    var set=root.getAttribute('data-theme');
+    if(set==='light'||set==='dark') return set;
+    return (window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)
+      ? 'dark' : 'light';
+  }
+  function paint(){
+    var dark=effective()==='dark';
+    btn.textContent=dark?'\u2600':'\u263e';
+    btn.setAttribute('aria-label',dark?'Switch to light theme':'Switch to dark theme');
+  }
+  btn.addEventListener('click',function(){
+    var next=effective()==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem(KEY,next);}catch(e){}
+    paint();
+  });
+  if(window.matchMedia){
+    var mq=window.matchMedia('(prefers-color-scheme: dark)');
+    if(mq.addEventListener) mq.addEventListener('change',paint);
+    else if(mq.addListener) mq.addListener(paint);
+  }
+  paint();
+})();
+</script>"""
 
 # --------------------------------------------------------------------------- #
 #  HTTP handler                                                               #
@@ -4272,6 +4667,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 return self._stream_camera(cam, "built-in camera")
             if self.path.startswith("/audio.pcm"):
                 return self._stream_audio()
+            if self.path.startswith("/flight_stick.json"):
+                try:
+                    return self._send_json(node.flight_stick.snapshot())
+                except Exception as exc:
+                    return self._send_json({"connected": False, "error": str(exc)}, 500)
             if self.path.startswith("/status.json"):
                 try:
                     return self._send_json(status_fields(node, cam, audio))
@@ -4282,14 +4682,6 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json(node.joint_state_snapshot())
                 except Exception as exc:
                     return self._send_json({"error": str(exc)}, 500)
-            if self.path in ("/mobile", "/mobile/"):
-                try:
-                    return self._send_html(render_game_mobile_page(node, cam, audio))
-                except Exception as exc:
-                    return self._send_html(
-                        f"<pre>mobile render error: {html.escape(str(exc))}</pre>",
-                        500,
-                    )
             if self.path in ("/", "/index.html"):
                 try:
                     return self._send_html(render_page(node, cam, audio))
@@ -4337,36 +4729,6 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
             self.end_headers()
 
         def do_POST(self):
-            if self.path == "/set_low_light":
-                try:
-                    form = self._read_form(512)
-                except (UnicodeError, ValueError) as exc:
-                    return self._send_html(
-                        f"<h2>Request rejected</h2><p>{html.escape(str(exc))}</p>",
-                        400,
-                    )
-                if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
-                    return self._send_html(
-                        "<h2>403 Forbidden</h2><p>Invalid control token.</p>",
-                        403,
-                    )
-                action = form.get("action", "")
-                if action not in ("enable", "disable"):
-                    return self._send_html("<h2>Invalid low-light action</h2>", 400)
-                try:
-                    config = save_low_light_config(action == "enable")
-                    restarted = restart_active_realsense_workloads(
-                        getattr(node, "robot_ssh_host", "")
-                    )
-                    node.flash = (
-                        f"RealSense low-light mode {'enabled' if config['enabled'] else 'disabled'}"
-                        + (f"; restarted {', '.join(restarted)}."
-                           if restarted else ". It will apply when a camera workload starts.")
-                    )
-                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                    node.flash = f"Low-light setting saved, but camera restart failed: {exc}"
-                node.get_logger().info(node.flash)
-                return self._redirect_home()
             if self.path == "/audio_pipeline":
                 try:
                     form = self._read_form(1024)
@@ -4549,22 +4911,6 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                         )
                 node.get_logger().info(node.flash)
                 return self._redirect_home()
-            if self.path == "/web_jog_dual":
-                try:
-                    form = self._read_form(768)
-                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
-                        return self._send_json({
-                            "ok": False, "message": "Invalid control token."
-                        }, 403)
-                    ok, message = node.request_web_jog_dual(
-                        form.get("mode", ""), form.get("left_pair", ""),
-                        form.get("left_x", ""), form.get("left_y", ""),
-                        form.get("right_pair", ""), form.get("right_x", ""),
-                        form.get("right_y", ""),
-                    )
-                except (UnicodeError, ValueError) as exc:
-                    return self._send_json({"ok": False, "message": str(exc)}, 400)
-                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
             if self.path == "/web_jog":
                 try:
                     form = self._read_form(512)
@@ -4580,6 +4926,35 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json({"ok": False, "message": str(exc)}, 400)
                 # Keep successful 25 Hz joystick samples silent; rejected
                 # samples are surfaced to the browser but do not move the arm.
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            if self.path == "/airbus_jog":
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({
+                            "ok": False, "message": "Invalid control token."
+                        }, 403)
+                    ok, message = node.request_airbus_jog(form.get("mode", ""))
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            if self.path == "/airbus_gripper":
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({"ok": False, "message": "Invalid control token."}, 403)
+                    ok, message = node.request_airbus_gripper()
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            if self.path == "/airbus_rest":
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({"ok": False, "message": "Invalid control token."}, 403)
+                    ok, message = node.request_airbus_rest()
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
                 return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
             if self.path in ("/arm_target", "/arm_target_stop"):
                 try:
@@ -4629,7 +5004,7 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     node.get_logger().info(message)
                 return self._redirect_home()
             if self.path in (
-                "/mode_joint", "/mode_cartesian", "/mode_cylindrical",
+                "/mode_joint", "/mode_ready", "/mode_cartesian", "/mode_cylindrical",
                 "/mode_autonomous",
             ):
                 mode = self.path.removeprefix("/mode_").upper()
