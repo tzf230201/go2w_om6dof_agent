@@ -78,10 +78,21 @@ REST_BUTTON = 8
 
 # Jog speed. The flight stick's LIFT lever and the dashboard slider drive one
 # shared factor, so the two never disagree about how fast the arm will move.
-# The factor multiplies the per-mode limits below; it never raises them.
+# The factor multiplies the per-mode limits defined in the jog handlers.
+#
+# 2.00 doubles those limits, which still leaves every axis below the ceilings
+# in om6dof_controller/config/controller.yaml, so nothing is silently clamped:
+#
+#   JOINT             0.50 of 1.2   max_joint_command_velocity
+#   CARTESIAN linear  0.06 of 0.10  max_cartesian_linear_velocity
+#   CARTESIAN angular 0.70 of 1.0   max_cartesian_angular_velocity
+#   CYLINDRICAL theta 0.40 of 0.5   max_cylindrical_theta_velocity  <- tightest
+#
+# Raising JOG_SPEED_MAX beyond 2.00 requires re-checking that table first.
 SPEED_AXIS_INDEX = 3  # axis 4, the lever labelled LIFT on the card
 JOG_SPEED_MIN = 0.15  # never zero: a dead lever would look like a broken stick
-JOG_SPEED_MAX = 1.00
+JOG_SPEED_MAX = 2.00
+JOG_SPEED_DEFAULT = 1.00  # start at the tuned rate, never at the new ceiling
 
 
 class FlightStickMonitor:
@@ -563,7 +574,7 @@ def csrf_token_matches(provided: str, expected: str) -> bool:
 class MonitorNode(Node):
     # Class-level default so the attribute exists on every instance, including
     # the bare nodes the tests build without running __init__.
-    jog_speed_scale = JOG_SPEED_MAX
+    jog_speed_scale = JOG_SPEED_DEFAULT
 
     def __init__(self) -> None:
         super().__init__("go2w_web_monitor")
@@ -1330,9 +1341,17 @@ class MonitorNode(Node):
         # the lever ends up feeling inverted on a given stick.
         lift = float(axes[SPEED_AXIS_INDEX])
         lift = max(-1.0, min(1.0, lift if math.isfinite(lift) else 0.0))
-        self.jog_speed_scale = (
-            JOG_SPEED_MIN + (JOG_SPEED_MAX - JOG_SPEED_MIN) * (1.0 - lift) / 2.0
-        )
+        # Piecewise so the lever's centre detent is exactly the tuned rate:
+        # centre 100%, fully up JOG_SPEED_MAX, fully down JOG_SPEED_MIN. A
+        # single linear ramp would put 100% at an arbitrary lever position.
+        if lift <= 0.0:
+            self.jog_speed_scale = (
+                JOG_SPEED_DEFAULT + (JOG_SPEED_MAX - JOG_SPEED_DEFAULT) * -lift
+            )
+        else:
+            self.jog_speed_scale = (
+                JOG_SPEED_DEFAULT - (JOG_SPEED_DEFAULT - JOG_SPEED_MIN) * lift
+            )
         scale = self.jog_speed_scale
         if normalized == "CARTESIAN":
             values = [x * 0.03, y * 0.03, z * 0.03,
@@ -2921,6 +2940,9 @@ ul.nodes li:last-child{border-bottom:0}
 .jogspeed input[type=range]:disabled{opacity:.4;cursor:not-allowed}
 .jogspeed span{flex:none;min-width:4.5ch;text-align:right;color:var(--text);
   font-variant-numeric:tabular-nums}
+/* Above 100% the arm exceeds its tuned rate — an abnormal state, so it
+   earns colour under the same rule the buttons follow. */
+.jogspeed span.fast{color:var(--warn-fg);font-weight:600}
 .jogreadout{min-height:1.3em;margin-top:12px}
 .jogwarning{color:var(--warn-fg)}
 @media(max-width:560px){.webjog{grid-template-columns:1fr}.webstick{margin:auto}
@@ -3083,8 +3105,9 @@ function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;web
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
 let jogSpeedDragging=false;
 function sendJogSpeed(percent){const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',scale:String(percent/100)});fetch('/jog_speed',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()}).then(async r=>{if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Speed change rejected.','bad',5000)}}).catch(()=>showActionNotice('Speed change failed.','bad',5000))}
-function syncJogSpeed(d){const slider=document.getElementById('jog_speed'),label=document.getElementById('jog_speed_value');if(!slider)return;const airbus=controlSource()==='airbus';slider.disabled=airbus;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);if(label)label.textContent=percent+'%'+(airbus?' · LIFT':'')}
-function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{const label=document.getElementById('jog_speed_value');if(label)label.textContent=speed.value+'%'});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
+function paintJogSpeed(percent,airbus){const label=document.getElementById('jog_speed_value');if(!label)return;label.textContent=percent+'%'+(airbus?' · LIFT':'');label.classList.toggle('fast',percent>100)}
+function syncJogSpeed(d){const slider=document.getElementById('jog_speed');if(!slider)return;const airbus=controlSource()==='airbus';slider.disabled=airbus;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);paintJogSpeed(percent,airbus)}
+function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{paintJogSpeed(Number(speed.value),false)});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
 function renderFlightAnalog(a){const axis=i=>Math.max(-1,Math.min(1,Number(a[i]||0)));const set=(id,prop,val)=>{const el=document.getElementById(id);if(el)el.style.setProperty(prop,val)};set('flight_stick_big_knob','--x',axis(0));set('flight_stick_big_knob','--y',axis(1));set('flight_stick_small_knob','--x',axis(4));set('flight_stick_small_knob','--y',axis(5));set('flight_stick_yaw','--yaw',axis(2));set('flight_stick_lift_knob','--v',axis(3))}
 async function sendAirbusJog(){if(controlSource()!=='airbus'||!webJogAllowed)return;const mode=armControlMode;if(!['CARTESIAN','CYLINDRICAL'].includes(mode))return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode});try{const r=await fetch('/airbus_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus joystick command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus joystick connection lost.','bad',6000)}}
 async function sendAirbusGripper(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_gripper',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus gripper command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus gripper connection lost.','bad',6000)}}
@@ -4142,8 +4165,8 @@ def render_page(
           <div class="jogaxes" id="web_jog_axes"></div>
           <div class="jogspeed">
             <label class="small" for="jog_speed">Speed</label>
-            <input type="range" id="jog_speed" min="15" max="100" step="1" value="100"
-                   aria-label="Jog speed, percent of the maximum for the current mode">
+            <input type="range" id="jog_speed" min="15" max="200" step="1" value="100"
+                   aria-label="Jog speed, percent of the tuned rate for the current mode">
             <span class="mono" id="jog_speed_value">100%</span>
           </div>
           <p class="mono jogreadout" id="web_jog_readout">Loading controller state…</p>

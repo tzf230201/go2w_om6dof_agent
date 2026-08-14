@@ -98,9 +98,10 @@ buttons, last button event, and normalized axis values.
 | 8 | toggle REST/READY | press edge |
 | 1 / 2 | pitch up / down | held |
 
-The **LIFT lever (axis 4)** is the speed throttle: lever up runs at full scale,
-lever down slows to 15%. If it feels inverted on a particular stick, flip the
-sign where `SPEED_AXIS_INDEX` is read in `request_airbus_jog`.
+The **LIFT lever (axis 4)** is the speed throttle: centre is the tuned rate,
+fully up is 200%, fully down is 15%. See [Jog speed](#jog-speed). If it feels
+inverted on a particular stick, flip the sign where `SPEED_AXIS_INDEX` is read
+in `request_airbus_jog`.
 
 Gripping and releasing are separate buttons on purpose. An earlier mapping
 gripped while Button 4 was held and opened the moment it was released, so
@@ -340,12 +341,31 @@ never disagree about how fast the arm will move:
 - the **Speed slider** in the velocity joystick card sets it otherwise, and
   turns into a live readout (greyed, suffixed `· LIFT`) while the lever owns it.
 
-The factor spans `JOG_SPEED_MIN` (15%) to `JOG_SPEED_MAX` (100%) and multiplies
-the per-mode limits already defined in `request_web_jog` and
-`request_airbus_jog`. It can only ever **reduce** speed: at 100% the published
-velocity equals the existing tuned limit, and those limits stay deliberately
-below the `controller.yaml` maxima. The floor is not zero on purpose — a lever
-that commanded a full stop would be indistinguishable from a broken stick.
+The factor spans `JOG_SPEED_MIN` (15%) to `JOG_SPEED_MAX` (200%) and multiplies
+the per-mode limits defined in `request_web_jog` and `request_airbus_jog`. It
+starts at `JOG_SPEED_DEFAULT` (100%), the rate those limits were tuned for, so
+the ceiling is opt-in rather than the resting state.
+
+The LIFT lever is piecewise so its centre detent is exactly 100%: centre is the
+tuned rate, fully up is 200%, fully down is 15%. A single linear ramp would put
+100% at some arbitrary lever angle. The slider shows values above 100% in amber,
+since running past the tuned rate is an abnormal state.
+
+The floor is not zero on purpose — a lever that commanded a full stop would be
+indistinguishable from a broken stick.
+
+At 200% every axis still sits below the ceilings in
+`om6dof_controller/config/controller.yaml`, so nothing is silently clamped:
+
+| Mode | at 200% | `controller.yaml` ceiling | headroom |
+|---|---|---|---|
+| JOINT | 0.50 | 1.2 `max_joint_command_velocity` | 58% |
+| CARTESIAN linear | 0.06 | 0.10 `max_cartesian_linear_velocity` | 40% |
+| CARTESIAN angular | 0.70 | 1.0 `max_cartesian_angular_velocity` | 30% |
+| CYLINDRICAL theta | 0.40 | 0.5 `max_cylindrical_theta_velocity` | 20% |
+
+**Re-check that table before raising `JOG_SPEED_MAX` again.** Cylindrical theta
+is the tightest and is what would run out first.
 
 The current value is published as `jog_speed_scale` in `/status.json`, which is
 what keeps the slider in step with the lever at the 1 Hz status poll.
