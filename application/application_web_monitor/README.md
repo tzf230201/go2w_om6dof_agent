@@ -86,8 +86,31 @@ normal convention for 3D views.
 When a USB flight stick is connected, the dashboard shows a **Flight stick
 input** card. It discovers Linux joystick devices at `/dev/input/js*`, prefers
 names containing `Thrustmaster`, `TCA`, or `Airbus`, and displays the held
-buttons, last button event, and normalized axis values. It is read-only and
-does not publish robot commands.
+buttons, last button event, and normalized axis values.
+
+> **This stick commands the arm.** The card is not a passive readout: its axes
+> jog the arm and four of its buttons actuate hardware.
+
+| Button | Action | Fires on |
+|---|---|---|
+| 4 | grip (close) | press edge |
+| 3 | release (open) | press edge |
+| 8 | toggle REST/READY | press edge |
+| 1 / 2 | pitch up / down | held |
+
+Gripping and releasing are separate buttons on purpose. An earlier mapping
+gripped while Button 4 was held and opened the moment it was released, so
+anything being carried dropped as soon as a finger lifted. The gripper now
+keeps its last commanded state until the opposite button is pressed.
+
+The button numbers are the 1-based ones shown on the card, matching Linux
+joystick order. They are defined once as `GRIP_BUTTON`, `RELEASE_BUTTON`,
+`REST_BUTTON`, `PITCH_UP_BUTTON`, and `PITCH_DOWN_BUTTON` in `web_monitor.py`;
+remap there rather than editing the request handlers. Unlisted buttons are
+displayed only.
+
+Every one of these actions requires streaming arm control to be enabled first
+and is refused while a pickup, arm target, tracking, or search is running.
 
 The reference hardware is the Thrustmaster TCA Sidestick Airbus Edition.
 Vendor manuals, drivers, and the button numbering are at

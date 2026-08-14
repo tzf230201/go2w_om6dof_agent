@@ -67,6 +67,15 @@ JS_EVENT_INIT = 0x80
 JSIOCGAXES = 0x80016A11
 JSIOCGBUTTONS = 0x80016A12
 
+# Flight-stick buttons that command the arm, in the 1-based numbering the
+# dashboard shows.  Named here so the mapping is auditable in one place and
+# a remap never means hunting bare integers through the request handlers.
+PITCH_UP_BUTTON = 1
+PITCH_DOWN_BUTTON = 2
+RELEASE_BUTTON = 3
+GRIP_BUTTON = 4
+REST_BUTTON = 8
+
 
 class FlightStickMonitor:
     """Non-blocking reader for a Linux joystick device, for diagnostics only."""
@@ -1285,7 +1294,8 @@ class MonitorNode(Node):
         yaw = deadzone(float(axes[0]))
         # Axis 6 now provides analogue Z.  Buttons 1/2 provide pitch steps.
         z = deadzone(float(axes[1]))
-        pitch = float((1 if 1 in pressed else 0) - (1 if 2 in pressed else 0))
+        pitch = float((1 if PITCH_UP_BUTTON in pressed else 0)
+                      - (1 if PITCH_DOWN_BUTTON in pressed else 0))
         # Axis 6=X, Axis 5=Y (or cylindrical theta), Axis 3=roll,
         # Axis 1=yaw, Axis 2=Z; B1/B2 are pitch +/-; B3/B4 open/close.
         if normalized == "CARTESIAN":
@@ -1298,20 +1308,24 @@ class MonitorNode(Node):
         return True, ""
 
     def request_airbus_gripper(self) -> Tuple[bool, str]:
-        """Hold Button 4 to grip; release it to open the gripper."""
+        """Button 4 grips, Button 3 releases; each fires on its press edge.
+
+        Holding a button no longer matters, so the gripper keeps its last
+        commanded state instead of springing open when a finger lifts.
+        """
         state = self.flight_stick.snapshot()
         if not state["connected"]:
             self._airbus_gripper_pressed.clear()
             return False, "Airbus gripper rejected: flight stick is disconnected."
-        pressed = set(state["buttons"])
-        was_gripping = 4 in self._airbus_gripper_pressed
-        is_gripping = 4 in pressed
-        self._airbus_gripper_pressed = {4} if is_gripping else set()
-        # Send exactly on the press/release edges: press grips, release opens.
-        command = "close" if is_gripping and not was_gripping else (
-            "open" if was_gripping and not is_gripping else ""
-        )
-        if not command:
+        pressed = set(state["buttons"]) & {GRIP_BUTTON, RELEASE_BUTTON}
+        new_presses = pressed - self._airbus_gripper_pressed
+        self._airbus_gripper_pressed = pressed
+        # Gripping wins if both edges land inside the same poll.
+        if GRIP_BUTTON in new_presses:
+            command = "close"
+        elif RELEASE_BUTTON in new_presses:
+            command = "open"
+        else:
             return True, ""
         if self.remote_enabled is not True:
             return False, "Airbus gripper rejected: enable streaming control first."
@@ -1325,9 +1339,9 @@ class MonitorNode(Node):
         return True, ""
 
     def request_airbus_rest(self) -> Tuple[bool, str]:
-        """Toggle REST/READY from the Button 3 press edge."""
+        """Toggle REST/READY from the Button 8 press edge."""
         state = self.flight_stick.snapshot()
-        pressed = bool(state["connected"] and 3 in set(state["buttons"]))
+        pressed = bool(state["connected"] and REST_BUTTON in set(state["buttons"]))
         was_pressed = self._airbus_rest_pressed
         self._airbus_rest_pressed = pressed
         if not pressed or was_pressed:
@@ -4114,7 +4128,10 @@ def render_page(
         <div class="flightstick-readout"><h4>Axis live</h4><div id="flight_stick_axes">No axes</div><p class="flightstick-legend">Blue = pressed<br>Button numbers follow Linux joystick order.</p></div>
       </div>
       <div class="fs-buttons"><span class="fs-btn" data-btn="1">1</span><span class="fs-btn" data-btn="2">2</span><span class="fs-btn" data-btn="3">3</span><span class="fs-btn" data-btn="4">4</span><span class="fs-btn" data-btn="5">5</span><span class="fs-btn" data-btn="6">6</span><span class="fs-btn" data-btn="7">7</span><span class="fs-btn" data-btn="8">8</span><span class="fs-btn" data-btn="9">9</span><span class="fs-btn" data-btn="10">10</span><span class="fs-btn" data-btn="11">11</span><span class="fs-btn" data-btn="12">12</span><span class="fs-btn" data-btn="13">13</span><span class="fs-btn" data-btn="14">14</span><span class="fs-btn" data-btn="15">15</span><span class="fs-btn" data-btn="16">16</span><span class="fs-btn" data-btn="17">17</span></div>
-      <p class="small">Pressed buttons turn blue. This is monitor-only: it does not send robot commands.</p>
+      <p class="small">Pressed buttons turn blue. <b>This stick commands the arm.</b>
+      Button 4 grips, Button 3 releases, Button 8 toggles REST/READY, Buttons 1 and 2 step pitch.
+      The axes jog the arm in CARTESIAN and CYLINDRICAL modes. Every one of these needs streaming
+      control enabled first; the remaining buttons are unassigned and only shown.</p>
     </div>
     """
 
