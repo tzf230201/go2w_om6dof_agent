@@ -76,6 +76,13 @@ RELEASE_BUTTON = 3
 GRIP_BUTTON = 4
 REST_BUTTON = 8
 
+# Jog speed. The flight stick's LIFT lever and the dashboard slider drive one
+# shared factor, so the two never disagree about how fast the arm will move.
+# The factor multiplies the per-mode limits below; it never raises them.
+SPEED_AXIS_INDEX = 3  # axis 4, the lever labelled LIFT on the card
+JOG_SPEED_MIN = 0.15  # never zero: a dead lever would look like a broken stick
+JOG_SPEED_MAX = 1.00
+
 
 class FlightStickMonitor:
     """Non-blocking reader for a Linux joystick device, for diagnostics only."""
@@ -554,6 +561,10 @@ def csrf_token_matches(provided: str, expected: str) -> bool:
 #  ROS node: graph introspection + F3 publisher                               #
 # --------------------------------------------------------------------------- #
 class MonitorNode(Node):
+    # Class-level default so the attribute exists on every instance, including
+    # the bare nodes the tests build without running __init__.
+    jog_speed_scale = JOG_SPEED_MAX
+
     def __init__(self) -> None:
         super().__init__("go2w_web_monitor")
         self.flash = ""  # one-shot banner (e.g. kill result), shown then cleared
@@ -1212,6 +1223,21 @@ class MonitorNode(Node):
         self.set_operation_mode("STARTUP")
         return True, self.rest_message
 
+    def set_jog_speed(self, scale) -> Tuple[bool, str]:
+        """Set the shared jog speed factor from the dashboard slider.
+
+        Clamped rather than rejected at the edges, so a slider that reports
+        1.0001 does not surface as an error to the operator.
+        """
+        try:
+            value = float(scale)
+        except (TypeError, ValueError):
+            return False, "Speed rejected: value must be a number."
+        if not math.isfinite(value):
+            return False, "Speed rejected: value must be finite."
+        self.jog_speed_scale = min(JOG_SPEED_MAX, max(JOG_SPEED_MIN, value))
+        return True, ""
+
     def request_web_jog(
         self, mode: str, axis_pair: int, x: float, y: float
     ) -> Tuple[bool, str]:
@@ -1252,8 +1278,9 @@ class MonitorNode(Node):
         values = [0.0] * 6
         index = axis_pair * 2
         x_speed, y_speed = speed_pairs[normalized][axis_pair]
-        values[index] = x * x_speed
-        values[index + 1] = y * y_speed
+        scale = self.jog_speed_scale
+        values[index] = x * x_speed * scale
+        values[index + 1] = y * y_speed * scale
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
@@ -1298,12 +1325,22 @@ class MonitorNode(Node):
                       - (1 if PITCH_DOWN_BUTTON in pressed else 0))
         # Axis 6=X, Axis 5=Y (or cylindrical theta), Axis 3=roll,
         # Axis 1=yaw, Axis 2=Z; B1/B2 are pitch +/-; B3/B4 open/close.
+        # The LIFT lever is the speed throttle: lever up runs at full scale,
+        # lever down slows everything to JOG_SPEED_MIN. Flip the sign here if
+        # the lever ends up feeling inverted on a given stick.
+        lift = float(axes[SPEED_AXIS_INDEX])
+        lift = max(-1.0, min(1.0, lift if math.isfinite(lift) else 0.0))
+        self.jog_speed_scale = (
+            JOG_SPEED_MIN + (JOG_SPEED_MAX - JOG_SPEED_MIN) * (1.0 - lift) / 2.0
+        )
+        scale = self.jog_speed_scale
         if normalized == "CARTESIAN":
             values = [x * 0.03, y * 0.03, z * 0.03,
                       roll * 0.35, pitch * 0.35, yaw * 0.35]
         else:
             values = [x * 0.025, y * 0.20, z * 0.025,
                       roll * 0.35, pitch * 0.35, yaw * 0.35]
+        values = [value * scale for value in values]
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
@@ -2875,6 +2912,15 @@ ul.nodes li:last-child{border-bottom:0}
 .jogaxes button{padding:9px 6px;font-size:13px;background:var(--surface-2);color:var(--text)}
 .jogaxes button:hover:not(:disabled){background:var(--surface-3)}
 .jogaxes button.selected{background:var(--accent-solid);color:var(--accent-fg)}
+/* Speed throttle. Mirrors the flight stick's LIFT lever: both drive the
+   same shared factor, so whichever one moves, this readout follows. */
+.jogspeed{display:flex;align-items:center;gap:11px;margin-top:14px}
+.jogspeed label{flex:none}
+.jogspeed input[type=range]{flex:1;min-width:0;accent-color:var(--accent-solid);
+  height:22px;cursor:pointer}
+.jogspeed input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+.jogspeed span{flex:none;min-width:4.5ch;text-align:right;color:var(--text);
+  font-variant-numeric:tabular-nums}
 .jogreadout{min-height:1.3em;margin-top:12px}
 .jogwarning{color:var(--warn-fg)}
 @media(max-width:560px){.webjog{grid-template-columns:1fr}.webstick{margin:auto}
@@ -3030,12 +3076,15 @@ const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
 function controlSource(){return document.getElementById('control_source')?.value||'web'}
-function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=controlSource()==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=controlSource()==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
-function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
+let jogSpeedDragging=false;
+function sendJogSpeed(percent){const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',scale:String(percent/100)});fetch('/jog_speed',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()}).then(async r=>{if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Speed change rejected.','bad',5000)}}).catch(()=>showActionNotice('Speed change failed.','bad',5000))}
+function syncJogSpeed(d){const slider=document.getElementById('jog_speed'),label=document.getElementById('jog_speed_value');if(!slider)return;const airbus=controlSource()==='airbus';slider.disabled=airbus;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);if(label)label.textContent=percent+'%'+(airbus?' · LIFT':'')}
+function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{const label=document.getElementById('jog_speed_value');if(label)label.textContent=speed.value+'%'});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
 function renderFlightAnalog(a){const axis=i=>Math.max(-1,Math.min(1,Number(a[i]||0)));const set=(id,prop,val)=>{const el=document.getElementById(id);if(el)el.style.setProperty(prop,val)};set('flight_stick_big_knob','--x',axis(0));set('flight_stick_big_knob','--y',axis(1));set('flight_stick_small_knob','--x',axis(4));set('flight_stick_small_knob','--y',axis(5));set('flight_stick_yaw','--yaw',axis(2));set('flight_stick_lift_knob','--v',axis(3))}
 async function sendAirbusJog(){if(controlSource()!=='airbus'||!webJogAllowed)return;const mode=armControlMode;if(!['CARTESIAN','CYLINDRICAL'].includes(mode))return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode});try{const r=await fetch('/airbus_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus joystick command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus joystick connection lost.','bad',6000)}}
 async function sendAirbusGripper(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_gripper',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus gripper command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus gripper connection lost.','bad',6000)}}
@@ -3672,6 +3721,7 @@ def status_fields(node, cam=None, audio=None) -> dict:
         "battery": battery_pill(node),
         "arm_bus": pill(info["arm_bus"], "present", "MISSING"),
         "teleop": pill(teleop_on, "REMOTE ENABLED", "remote disabled"),
+        "jog_speed_scale": round(float(node.jog_speed_scale), 3),
         "remote_enabled": teleop_on,
         "control_mode": (
             f'<span class="pill ok">{html.escape(node.control_mode)}</span>'
@@ -4090,6 +4140,12 @@ def render_page(
           </select>
           <p class="small">Choose the pair of axes controlled by the stick.</p>
           <div class="jogaxes" id="web_jog_axes"></div>
+          <div class="jogspeed">
+            <label class="small" for="jog_speed">Speed</label>
+            <input type="range" id="jog_speed" min="15" max="100" step="1" value="100"
+                   aria-label="Jog speed, percent of the maximum for the current mode">
+            <span class="mono" id="jog_speed_value">100%</span>
+          </div>
           <p class="mono jogreadout" id="web_jog_readout">Loading controller state…</p>
         </div>
       </div>
@@ -4955,6 +5011,18 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 # Keep successful 25 Hz joystick samples silent; rejected
                 # samples are surfaced to the browser but do not move the arm.
                 return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            if self.path == "/jog_speed":
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({
+                            "ok": False, "message": "Invalid control token."
+                        }, 403)
+                    ok, message = node.set_jog_speed(form.get("scale", ""))
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                return self._send_json({"ok": ok, "message": message},
+                                       200 if ok else 400)
             if self.path == "/airbus_jog":
                 try:
                     form = self._read_form(512)

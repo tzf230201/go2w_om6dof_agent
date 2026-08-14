@@ -98,6 +98,10 @@ buttons, last button event, and normalized axis values.
 | 8 | toggle REST/READY | press edge |
 | 1 / 2 | pitch up / down | held |
 
+The **LIFT lever (axis 4)** is the speed throttle: lever up runs at full scale,
+lever down slows to 15%. If it feels inverted on a particular stick, flip the
+sign where `SPEED_AXIS_INDEX` is read in `request_airbus_jog`.
+
 Gripping and releasing are separate buttons on purpose. An earlier mapping
 gripped while Button 4 was held and opened the moment it was released, so
 anything being carried dropped as soon as a finger lifted. The gripper now
@@ -326,6 +330,25 @@ connection to the Jetson NX therefore does not stop the dashboard.
 
 Do not set `robot_ssh_host` in this topology: an empty value makes all OM6DOF
 systemd checks and controls local to the AGX.
+
+## Jog speed
+
+Both jog paths share one speed factor, so the flight stick and the browser can
+never disagree about how fast the arm will move:
+
+- the flight stick's **LIFT lever** sets it while the control source is Airbus;
+- the **Speed slider** in the velocity joystick card sets it otherwise, and
+  turns into a live readout (greyed, suffixed `· LIFT`) while the lever owns it.
+
+The factor spans `JOG_SPEED_MIN` (15%) to `JOG_SPEED_MAX` (100%) and multiplies
+the per-mode limits already defined in `request_web_jog` and
+`request_airbus_jog`. It can only ever **reduce** speed: at 100% the published
+velocity equals the existing tuned limit, and those limits stay deliberately
+below the `controller.yaml` maxima. The floor is not zero on purpose — a lever
+that commanded a full stop would be indistinguishable from a broken stick.
+
+The current value is published as `jog_speed_scale` in `/status.json`, which is
+what keeps the slider in step with the lever at the 1 Hz status poll.
 
 ## Live OM6DOF position visualization
 
