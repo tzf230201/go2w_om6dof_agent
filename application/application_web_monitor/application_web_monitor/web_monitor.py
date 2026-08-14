@@ -2876,9 +2876,16 @@ ul.nodes li:last-child{border-bottom:0}
 .fs-stage{display:grid;grid-template-columns:minmax(0,1fr) 46px;gap:16px;
   align-items:center;padding:32px 20px 22px;border-radius:16px;background:var(--surface-2)}
 .fs-analog{position:relative;width:100%;max-width:200px;aspect-ratio:1;margin:0 auto}
+/* Yaw reads as a needle on a static track. Colouring two adjacent borders
+   instead would draw a 180 degree arc mitred at the corners, so it would be
+   centred on the 45 degree diagonal and look tilted at rest. */
 .fs-yaw{position:absolute;inset:0;border-radius:50%;border:3px solid var(--line-2);
-  border-top-color:var(--warn-fg);border-right-color:var(--warn-fg);
   transform:rotate(calc(var(--yaw,0) * 135deg));transition:transform .09s linear}
+.fs-yaw-needle{position:absolute;left:50%;top:-7px;width:13px;height:13px;
+  transform:translateX(-50%);border-radius:50%;background:var(--warn-fg);
+  box-shadow:0 0 0 3px var(--surface-2)}
+.fs-yaw-zero{position:absolute;left:50%;top:7px;width:2px;height:7px;
+  transform:translateX(-50%);border-radius:1px;background:var(--text-3);opacity:.55}
 .fs-yaw-label{position:absolute;left:50%;top:-8px;transform:translate(-50%,-100%);
   color:var(--warn-fg);font:600 11px ui-monospace,monospace}
 .fs-big{position:absolute;inset:13%;border-radius:50%;background:var(--surface)}
@@ -2896,10 +2903,13 @@ ul.nodes li:last-child{border-bottom:0}
   transition:transform .09s linear}
 .fs-big>.fs-knob{--r:34px;width:38px;height:38px;background:var(--accent-solid)}
 .fs-small>.fs-knob{--r:11px;width:19px;height:19px;background:var(--ok-fg)}
-.fs-axislabels{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
-  display:flex;justify-content:space-between;padding:0 14px;color:var(--text-3);
+/* Each label sits on the axis it names: X on the horizontal crosshair,
+   Y on the vertical one. Laying them out side by side would imply both
+   axes run left to right. */
+.fs-axis-x,.fs-axis-y{position:absolute;color:var(--text-3);
   font:600 11px ui-monospace,monospace;pointer-events:none}
-.fs-axislabels i{font-style:normal}
+.fs-axis-x{left:11px;top:50%;transform:translateY(-50%)}
+.fs-axis-y{left:50%;top:9px;transform:translateX(-50%)}
 .fs-small-label{position:absolute;left:50%;bottom:-18px;transform:translateX(-50%);
   color:var(--ok-fg);font:600 10px ui-monospace,monospace;white-space:nowrap}
 .fs-lift{position:relative;height:186px;border-radius:24px;background:var(--surface)}
@@ -4083,10 +4093,11 @@ def render_page(
       <div class="flightstick-layout">
         <div class="fs-stage">
           <div class="fs-analog" aria-label="Large XY and yaw axes with nested small XY axes">
-            <div class="fs-yaw" id="flight_stick_yaw"></div>
+            <div class="fs-yaw" id="flight_stick_yaw"><span class="fs-yaw-needle"></span></div>
+            <span class="fs-yaw-zero"></span>
             <span class="fs-yaw-label">YAW</span>
             <div class="fs-big">
-              <span class="fs-axislabels"><i>X</i><i>Y</i></span>
+              <span class="fs-axis-x">X</span><span class="fs-axis-y">Y</span>
               <span class="fs-knob" id="flight_stick_big_knob"></span>
               <div class="fs-small">
                 <span class="fs-knob" id="flight_stick_small_knob"></span>

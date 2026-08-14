@@ -89,10 +89,30 @@ names containing `Thrustmaster`, `TCA`, or `Airbus`, and displays the held
 buttons, last button event, and normalized axis values. It is read-only and
 does not publish robot commands.
 
-The card is two independent blocks: an analog stage (large X/Y stick, yaw
-ring, nested small X/Y stick, and lift bar) and a plain grid of the 17
+The reference hardware is the Thrustmaster TCA Sidestick Airbus Edition.
+Vendor manuals, drivers, and the button numbering are at
+<https://support.thrustmaster.com/en/product/tca-sidestick-airbus-edition-en/#manual>.
+
+The card is two independent blocks: an analog stage and a plain grid of the 17
 buttons. Nothing is positioned on top of anything else, so no control can be
 clipped at any card width.
+
+The analog stage reads as follows:
+
+| Element | Axis | Shown as |
+|---|---|---|
+| Large stick | 1 and 2 | blue knob, `X` on the horizontal crosshair, `Y` on the vertical one |
+| Yaw | 3 | amber needle sweeping ±135° around a static track, with a tick marking zero at the top |
+| Lift | 4 | purple knob on the vertical bar |
+| Small stick | 5 and 6 | green knob inside the nested circle |
+
+Each axis label sits on the axis it names. Laying `X` and `Y` side by side
+would imply both axes run left to right, which is what the earlier layout did.
+
+Yaw is drawn as a needle on a static ring rather than as a rotating arc.
+Colouring two adjacent CSS borders produces a 180° arc mitred at the corners,
+so it is centred on the 45° diagonal and looks tilted even when the axis reads
+zero.
 
 Knob travel is driven by the CSS custom properties `--x`, `--y`, `--yaw`, and
 `--v`, which the client sets as unitless values between -1 and 1. CSS owns all
@@ -105,9 +125,18 @@ lsusb | grep -i -E 'thrustmaster|airbus|tca'
 ls -l /dev/input/js* /dev/input/by-id/* 2>/dev/null
 ```
 
-The account running `om6dof-web-monitor.service` must be allowed to read the
-matching `/dev/input/jsN` device, normally through membership in the `input`
-group.
+Whatever runs the dashboard must be allowed to read the matching
+`/dev/input/jsN` device, and how that is granted differs per unit:
+
+- the **system** unit gets it from `SupplementaryGroups=input` in the unit
+  file, which only a privileged unit may set;
+- the **user** unit cannot add groups, so it relies on `kublab`'s own
+  membership. Grant it once with `sudo usermod -aG input kublab`, then log out
+  and back in.
+
+On a stock JetPack image `/dev/input/js0` is `crw-rw-r--`, so reads succeed
+without either measure — which means a permissions mistake here stays hidden
+until a udev rule tightens the node.
 
 ## Top status ribbon
 
@@ -188,6 +217,12 @@ Then double-click **Web Monitor Robot** on the AGX desktop and choose one mode:
 saved in `~/.config/om6dof-web-monitor/mode.env`; the current default is
 OM6DOF. Go2W telemetry and control still require the Go2W network link to be
 present.
+
+> **The picker only drives the system unit.** It writes `mode.env` and then
+> restarts `om6dof-web-monitor.service`. If the *user* unit is the one serving
+> port 8080, the chosen mode silently has no effect, because that unit is
+> pinned to `go2w_enabled:=false` and never reads `mode.env`. See
+> [Which unit actually runs the dashboard](#which-unit-actually-runs-the-dashboard).
 
 ### MoveIt desktop shortcut
 
@@ -292,10 +327,56 @@ curl -fsS http://127.0.0.1:8080/joint_state.json
 The viewer is embedded in the monitor and does not require rosbridge, Three.js,
 a CDN, or internet access.
 
+## Which unit actually runs the dashboard
+
+`systemd/` ships **two** units for the web monitor and they bind the same port,
+so exactly one of them may be enabled at a time:
+
+| Unit | Runs | Mode |
+|---|---|---|
+| `om6dof-web-monitor.service` (system) | `utility/launch_web_monitor.sh` | reads `~/.config/om6dof-web-monitor/mode.env`, so the desktop mode picker works |
+| `om6dof-web-monitor-user.service` (user) | `ros2 run … web_monitor` directly | pinned to `go2w_enabled:=false`, OM6DOF only |
+
+Check which one is live before touching either:
+
+```bash
+systemctl is-enabled om6dof-web-monitor.service
+systemctl --user is-enabled om6dof-web-monitor.service
+ss -ltnp | grep :8080
+```
+
+Two consequences follow from this that are easy to get wrong:
+
+- **Restarting the disabled unit breaks nothing but wastes the machine.** It
+  cannot bind port 8080 while the other one holds it, so with
+  `Restart=on-failure` it respawns a full ROS node every five seconds and
+  fails, indefinitely. `systemctl is-active` reports `activating`, not
+  `failed`, so it is easy to miss.
+- **The desktop mode picker only drives the system unit.**
+  `utility/select_web_monitor_mode.sh` runs
+  `sudo systemctl restart om6dof-web-monitor.service`. If the *user* unit is
+  the one serving, the picker writes `mode.env`, restarts a unit that is not
+  running, and the mode silently never changes — because the user unit does
+  not read `mode.env` at all.
+
+The narrow sudoers rule permits `restart`, `is-active`, and `daemon-reload`
+only. Stopping the system unit therefore needs a real password:
+
+```bash
+sudo systemctl stop om6dof-web-monitor.service
+sudo systemctl disable om6dof-web-monitor.service
+```
+
+Use the **user** unit when the AGX only ever serves OM6DOF; it needs no DBus
+workaround because it already lives in the user manager, and `Linger=yes`
+starts it at boot without a login. Use the **system** unit when the mode
+picker matters. Do not enable both.
+
 ## Install as an AGX system service
 
 After building, install the supplied standalone unit and the narrowly scoped
-sudo rule used by the OM6DOF restart button:
+sudo rule used by the OM6DOF restart button. Disable the user unit first if it
+is enabled, or the two will fight over port 8080:
 
 ```bash
 sudo install -o root -g root -m 0644 \
