@@ -184,7 +184,11 @@ buttons, last button event, and normalized axis values.
 | 4 | grip (close) | press edge |
 | 3 | release (open) | press edge |
 | 8 | toggle REST/READY | press edge |
-| 1 / 2 | pitch up / down | held |
+| 1 / 2 | Z up / down | held |
+
+Axis 2 carries **pitch**, proportionally. Buttons 1 and 2 step **Z** instead.
+These were the other way round originally; pitch is the finer of the two to
+fly, so it holds the analogue axis while Z steps.
 
 The **LIFT lever (axis 4)** is the speed throttle: centre is the tuned rate,
 fully up is 200%, fully down is 15%. See [Jog speed](#jog-speed). If it feels

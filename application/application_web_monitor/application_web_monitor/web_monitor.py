@@ -70,8 +70,10 @@ JSIOCGBUTTONS = 0x80016A12
 # Flight-stick buttons that command the arm, in the 1-based numbering the
 # dashboard shows.  Named here so the mapping is auditable in one place and
 # a remap never means hunting bare integers through the request handlers.
-PITCH_UP_BUTTON = 1
-PITCH_DOWN_BUTTON = 2
+# Buttons 1 and 2 step Z; axis 2 carries pitch. They were the other way
+# round until the operator swapped them, so pitch is proportional now.
+LIFT_UP_BUTTON = 1
+LIFT_DOWN_BUTTON = 2
 RELEASE_BUTTON = 3
 GRIP_BUTTON = 4
 REST_BUTTON = 8
@@ -1386,15 +1388,15 @@ class MonitorNode(Node):
         # Preserve each robot-control direction while changing the input axis.
         x = -deadzone(float(axes[5]))
         y = -deadzone(float(axes[4]))
-        # Axis 3 remains roll; Axis 1 is now yaw; Axis 2 is now Z.
         roll = deadzone(float(axes[2]))
         yaw = deadzone(float(axes[0]))
-        # Axis 6 now provides analogue Z.  Buttons 1/2 provide pitch steps.
-        z = deadzone(float(axes[1]))
-        pitch = float((1 if PITCH_UP_BUTTON in pressed else 0)
-                      - (1 if PITCH_DOWN_BUTTON in pressed else 0))
+        # Axis 2 carries pitch and buttons 1/2 step Z. Pitch is the finer of
+        # the two to fly, so it gets the proportional axis.
+        pitch = deadzone(float(axes[1]))
+        z = float((1 if LIFT_UP_BUTTON in pressed else 0)
+                  - (1 if LIFT_DOWN_BUTTON in pressed else 0))
         # Axis 6=X, Axis 5=Y (or cylindrical theta), Axis 3=roll,
-        # Axis 1=yaw, Axis 2=Z; B1/B2 are pitch +/-; B3/B4 open/close.
+        # Axis 1=yaw, Axis 2=pitch; B1/B2 step Z; B3/B4 open/close.
         # The LIFT lever is the speed throttle: lever up runs at full scale,
         # lever down slows everything to JOG_SPEED_MIN. Flip the sign here if
         # the lever ends up feeling inverted on a given stick.
@@ -4524,7 +4526,7 @@ def render_page(
       </div>
       <div class="fs-buttons"><span class="fs-btn" data-btn="1">1</span><span class="fs-btn" data-btn="2">2</span><span class="fs-btn" data-btn="3">3</span><span class="fs-btn" data-btn="4">4</span><span class="fs-btn" data-btn="5">5</span><span class="fs-btn" data-btn="6">6</span><span class="fs-btn" data-btn="7">7</span><span class="fs-btn" data-btn="8">8</span><span class="fs-btn" data-btn="9">9</span><span class="fs-btn" data-btn="10">10</span><span class="fs-btn" data-btn="11">11</span><span class="fs-btn" data-btn="12">12</span><span class="fs-btn" data-btn="13">13</span><span class="fs-btn" data-btn="14">14</span><span class="fs-btn" data-btn="15">15</span><span class="fs-btn" data-btn="16">16</span><span class="fs-btn" data-btn="17">17</span></div>
       <p class="small">Pressed buttons turn blue. <b>This stick commands the arm.</b>
-      Button 4 grips, Button 3 releases, Button 8 toggles REST/READY, Buttons 1 and 2 step pitch.
+      Button 4 grips, Button 3 releases, Button 8 toggles REST/READY, Buttons 1 and 2 step Z.
       The axes jog the arm in CARTESIAN and CYLINDRICAL modes. Every one of these needs streaming
       control enabled first; the remaining buttons are unassigned and only shown.</p>
     </div>
