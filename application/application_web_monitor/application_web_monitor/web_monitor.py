@@ -1562,7 +1562,7 @@ class MonitorNode(Node):
         # up is negated to drive its axis positive, matching the TCA and the
         # web joystick.
         forward = -axis(PAD_LEFT_Y)    # left stick, forward and back
-        lateral = axis(PAD_LEFT_X)     # left stick, left and right
+        lateral = -axis(PAD_LEFT_X)    # left stick, left and right
         lift = -axis(PAD_RIGHT_Y)      # right stick, up and down
         held = set(state["buttons"])
         step = lambda plus, minus: float((1 if plus in held else 0)
