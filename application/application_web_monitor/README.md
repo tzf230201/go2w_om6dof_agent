@@ -106,13 +106,24 @@ mapping carries over and it gets its own profile:
 
 | Control | Action |
 |---|---|
-| Left stick | axis pair 1 |
-| Right stick | axis pair 2 |
+| Left stick | forward/back and left/right |
+| Right stick, vertical | up/down |
+| Y / A | pitch up / down |
+| B / X | roll right / left |
+| RB / LB | grip / release |
+| Start | toggle REST/READY |
 | RT | speed up, toward 200% |
 | LT | speed down, toward 15% |
-| A | grip |
-| B | release |
-| Start | toggle REST/READY |
+
+The mapping is Cartesian by nature, so the pad is accepted only in
+**CARTESIAN** and **CYLINDRICAL** modes. JOINT is refused rather than driving
+joints with controls whose labels would then be lying about what they do.
+
+Two inputs are deliberately unassigned: **yaw**, and the right stick's
+sideways axis. Pitch and roll come from buttons, so they step at a fixed rate
+rather than being proportional — the speed throttle still scales them.
+
+Grip and release sit on the shoulders because A and B carry pitch and roll.
 
 Neither trigger pressed is the tuned rate; the triggers are read as absolute
 positions rather than integrated, so the speed never drifts. On the `xpad`

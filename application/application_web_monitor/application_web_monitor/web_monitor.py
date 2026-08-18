@@ -106,8 +106,13 @@ GAMEPAD_NAME_HINTS = ("logitech", "logicool", "f710", "gamepad", "xbox", "x-box"
 PAD_LEFT_X, PAD_LEFT_Y = 0, 1
 PAD_RIGHT_X, PAD_RIGHT_Y = 3, 4
 PAD_TRIGGER_SLOWER, PAD_TRIGGER_FASTER = 2, 5
-PAD_GRIP_BUTTON = 1     # A
-PAD_RELEASE_BUTTON = 2  # B
+PAD_PITCH_UP_BUTTON = 4     # Y
+PAD_PITCH_DOWN_BUTTON = 1   # A
+PAD_ROLL_RIGHT_BUTTON = 2   # B
+PAD_ROLL_LEFT_BUTTON = 3    # X
+# Grip moved to the shoulders because A and B now carry pitch and roll.
+PAD_GRIP_BUTTON = 6     # RB
+PAD_RELEASE_BUTTON = 5  # LB
 PAD_REST_BUTTON = 8     # Start
 # Face labels in Linux button order, so the card shows what is printed on the
 # pad rather than making the operator count indices.
@@ -1505,8 +1510,11 @@ class MonitorNode(Node):
         toward JOG_SPEED_MAX and LT slows toward JOG_SPEED_MIN.
         """
         normalized = str(mode).strip().upper()
-        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
-            return False, "Gamepad control rejected: invalid operation mode."
+        # The mapping is Cartesian by nature -- forward, lateral, lift, pitch,
+        # roll -- so JOINT is refused rather than silently driving joints with
+        # controls whose labels would then be lying.
+        if normalized not in ("CARTESIAN", "CYLINDRICAL"):
+            return False, "Gamepad control requires CARTESIAN or CYLINDRICAL mode."
         with self._pickup_lock:
             if self.remote_enabled is not True:
                 return False, "Gamepad control rejected: enable streaming control first."
@@ -1549,20 +1557,33 @@ class MonitorNode(Node):
             - (JOG_SPEED_DEFAULT - JOG_SPEED_MIN) * slower
         )))
 
-        # Screen coordinates run down-positive; negate so pushing forward
-        # drives the axis positive, matching the TCA and the web joystick.
-        pair_one = (axis(PAD_LEFT_X), -axis(PAD_LEFT_Y))
-        pair_two = (axis(PAD_RIGHT_X), -axis(PAD_RIGHT_Y))
-        speed_pairs = {
-            "JOINT": ((0.25, 0.25), (0.25, 0.25)),
-            "CARTESIAN": ((0.03, 0.03), (0.03, 0.35)),
-            "CYLINDRICAL": ((0.025, 0.20), (0.025, 0.35)),
-        }[normalized]
-        values = [0.0] * 6
-        for slot, (vx, vy) in enumerate((pair_one, pair_two)):
-            x_speed, y_speed = speed_pairs[slot]
-            values[slot * 2] = vx * x_speed * self.jog_speed_scale
-            values[slot * 2 + 1] = vy * y_speed * self.jog_speed_scale
+        # The published frame is [X, Y, Z, roll, pitch, yaw].
+        # Screen coordinates run down-positive, so pushing a stick forward or
+        # up is negated to drive its axis positive, matching the TCA and the
+        # web joystick.
+        forward = -axis(PAD_LEFT_Y)    # left stick, forward and back
+        lateral = axis(PAD_LEFT_X)     # left stick, left and right
+        lift = -axis(PAD_RIGHT_Y)      # right stick, up and down
+        held = set(state["buttons"])
+        step = lambda plus, minus: float((1 if plus in held else 0)
+                                         - (1 if minus in held else 0))
+        pitch = step(PAD_PITCH_UP_BUTTON, PAD_PITCH_DOWN_BUTTON)
+        roll = step(PAD_ROLL_RIGHT_BUTTON, PAD_ROLL_LEFT_BUTTON)
+        # Yaw is deliberately unmapped: the right stick's X axis is free.
+        if normalized == "CARTESIAN":
+            linear = (0.03, 0.03, 0.03)
+        else:
+            linear = (0.025, 0.20, 0.025)
+        angular = 0.35
+        scale = self.jog_speed_scale
+        values = [
+            forward * linear[0] * scale,
+            lateral * linear[1] * scale,
+            lift * linear[2] * scale,
+            roll * angular * scale,
+            pitch * angular * scale,
+            0.0,
+        ]
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
@@ -3332,7 +3353,7 @@ const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
 function controlSource(){return document.getElementById('control_source')?.value||'web'}
-function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed?'Logitech F710 active · '+armControlMode+'. Left stick pair 1, right stick pair 2, LT/RT speed.':'Enable streaming control and select an accepted mode first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode)?'Logitech F710 active · '+armControlMode+'. Left stick moves, right stick lifts, Y/A pitch, B/X roll.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
@@ -4520,10 +4541,12 @@ def render_page(
         </div>
         <div class="flightstick-readout"><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed; clicking a stick lights its ring.</p></div>
       </div>
-      <p class="small"><b>This pad commands the arm</b> when Control source is set to it.
-      Left stick drives axis pair 1 and the right stick pair 2; RT speeds up to 200% and LT
-      slows to 15%; A grips, B releases, Start toggles REST/READY. Streaming control must be
-      enabled first; the remaining buttons are unassigned and only shown.</p>
+      <p class="small"><b>This pad commands the arm</b> when Control source is set to it,
+      in CARTESIAN or CYLINDRICAL mode. Left stick moves forward/back and left/right;
+      right stick moves up/down. Y and A pitch, B and X roll. RB grips, LB releases,
+      Start toggles REST/READY. RT speeds up to 200% and LT slows to 15%.
+      Streaming control must be enabled first. Yaw and the right stick's sideways axis
+      are unassigned; the remaining buttons are only shown.</p>
     </div>
     """
 
