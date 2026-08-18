@@ -82,18 +82,22 @@ REST_BUTTON = 8
 # shared factor, so the two never disagree about how fast the arm will move.
 # The factor multiplies the per-mode limits defined in the jog handlers.
 #
-# 2.00 doubles those limits, which still leaves every axis below the ceilings
-# in om6dof_controller/config/controller.yaml, so nothing is silently clamped:
+# 3.00 triples those limits and every axis still clears the ceilings in
+# om6dof_controller/config/controller.yaml, so nothing is silently clamped:
 #
-#   JOINT             0.50 of 1.2   max_joint_command_velocity
-#   CARTESIAN linear  0.06 of 0.10  max_cartesian_linear_velocity
-#   CARTESIAN angular 0.70 of 1.0   max_cartesian_angular_velocity
-#   CYLINDRICAL theta 0.40 of 0.5   max_cylindrical_theta_velocity  <- tightest
+#   JOINT               0.750 of 1.20   max_joint_command_velocity
+#   CARTESIAN linear    0.090 of 0.10   max_cartesian_linear_velocity  <- tightest
+#   CARTESIAN angular   1.050 of 1.10   max_cartesian_angular_velocity
+#   CYLINDRICAL theta   0.600 of 0.65   max_cylindrical_theta_velocity
 #
-# Raising JOG_SPEED_MAX beyond 2.00 requires re-checking that table first.
+# Reaching 3.00 required lifting the angular and theta ceilings from 1.0 and
+# 0.5; below those the readout would have kept climbing while rotation
+# clamped, which is worse than a lower honest limit.
+#
+# Raising JOG_SPEED_MAX beyond 3.00 requires re-checking that table first.
 SPEED_AXIS_INDEX = 3  # axis 4, the lever labelled LIFT on the card
 JOG_SPEED_MIN = 0.15  # never zero: a dead lever would look like a broken stick
-JOG_SPEED_MAX = 2.00
+JOG_SPEED_MAX = 3.00
 JOG_SPEED_DEFAULT = 1.00  # start at the tuned rate, never at the new ceiling
 
 # Two very different sticks can be plugged in at once, so each reader matches
@@ -4483,7 +4487,7 @@ def render_page(
           <div class="jogaxes" id="web_jog_axes"></div>
           <div class="jogspeed">
             <label class="small" for="jog_speed">Speed</label>
-            <input type="range" id="jog_speed" min="15" max="200" step="1" value="100"
+            <input type="range" id="jog_speed" min="15" max="300" step="1" value="100"
                    aria-label="Jog speed, percent of the tuned rate for the current mode">
             <span class="mono" id="jog_speed_value">100%</span>
           </div>

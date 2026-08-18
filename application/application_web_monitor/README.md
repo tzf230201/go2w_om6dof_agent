@@ -433,31 +433,42 @@ never disagree about how fast the arm will move:
 - the **Speed slider** in the velocity joystick card sets it otherwise, and
   turns into a live readout (greyed, suffixed `· LIFT`) while the lever owns it.
 
-The factor spans `JOG_SPEED_MIN` (15%) to `JOG_SPEED_MAX` (200%) and multiplies
+The factor spans `JOG_SPEED_MIN` (15%) to `JOG_SPEED_MAX` (300%) and multiplies
 the per-mode limits defined in `request_web_jog` and `request_airbus_jog`. It
 starts at `JOG_SPEED_DEFAULT` (100%), the rate those limits were tuned for, so
 the ceiling is opt-in rather than the resting state.
 
 The LIFT lever is piecewise so its centre detent is exactly 100%: centre is the
-tuned rate, fully up is 200%, fully down is 15%. A single linear ramp would put
+tuned rate, fully up is 300%, fully down is 15%. A single linear ramp would put
 100% at some arbitrary lever angle. The slider shows values above 100% in amber,
 since running past the tuned rate is an abnormal state.
 
 The floor is not zero on purpose — a lever that commanded a full stop would be
 indistinguishable from a broken stick.
 
-At 200% every axis still sits below the ceilings in
+At 300% every axis still sits below the ceilings in
 `om6dof_controller/config/controller.yaml`, so nothing is silently clamped:
 
-| Mode | at 200% | `controller.yaml` ceiling | headroom |
+| Mode | at 300% | `controller.yaml` ceiling | headroom |
 |---|---|---|---|
-| JOINT | 0.50 | 1.2 `max_joint_command_velocity` | 58% |
-| CARTESIAN linear | 0.06 | 0.10 `max_cartesian_linear_velocity` | 40% |
-| CARTESIAN angular | 0.70 | 1.0 `max_cartesian_angular_velocity` | 30% |
-| CYLINDRICAL theta | 0.40 | 0.5 `max_cylindrical_theta_velocity` | 20% |
+| JOINT | 0.750 | 1.20 `max_joint_command_velocity` | 60% |
+| CARTESIAN linear | 0.090 | 0.10 `max_cartesian_linear_velocity` | 11% |
+| CARTESIAN angular | 1.050 | 1.10 `max_cartesian_angular_velocity` | 5% |
+| CYLINDRICAL theta | 0.600 | 0.65 `max_cylindrical_theta_velocity` | 8% |
 
-**Re-check that table before raising `JOG_SPEED_MAX` again.** Cylindrical theta
-is the tightest and is what would run out first.
+Reaching 300% required lifting `max_cartesian_angular_velocity` from 1.0 to 1.1
+and `max_cylindrical_theta_velocity` from 0.5 to 0.65. Below those, translation
+would have tripled while rotation clamped at roughly 250-286% and the readout
+kept climbing — a number that lies is worse than a lower honest one. The same
+values are set as node defaults so the envelope does not depend on whether the
+yaml was loaded.
+
+Faster motion is likelier to trip `ik_max_joint_following_error` (0.30); if
+jogging starts being refused near the top of the range, that guard is the first
+thing to check.
+
+**Re-check that table before raising `JOG_SPEED_MAX` again.** The angular
+ceilings are tightest now, at 3.14x, and are what would run out first.
 
 The current value is published as `jog_speed_scale` in `/status.json`, which is
 what keeps the slider in step with the lever at the 1 Hz status poll.
