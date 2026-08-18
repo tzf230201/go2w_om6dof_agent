@@ -3175,8 +3175,8 @@ ul.nodes li:last-child{border-bottom:0}
    the thumbs expect them. Everything is positioned in percentages inside one
    aspect-ratio box, so the whole pad scales as a unit and no element can
    drift out of the body the way absolutely positioned pixels would. */
-.gp-stage{padding:20px 16px 16px;border-radius:16px;background:var(--surface-2)}
-.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.5;margin:0 auto}
+.gp-stage{padding:20px 16px 24px;border-radius:16px;background:var(--surface-2)}
+.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.35;margin:0 auto}
 .gp-shell{position:absolute;left:0;right:0;top:16%;bottom:0;border-radius:22% 22% 30% 30%/
   32% 32% 44% 44%;background:var(--surface);border:1px solid var(--line-2)}
 
@@ -3207,8 +3207,8 @@ ul.nodes li:last-child{border-bottom:0}
 /* F710 uses the DualShock arrangement: D-pad up on the left shoulder side,
    both sticks together along the bottom. It is not the Xbox layout, where
    the left stick and the D-pad trade places. */
-.gp-stick.left{left:25%;top:58%}
-.gp-stick.right{right:25%;top:58%}
+.gp-stick.left{left:25%;top:55%}
+.gp-stick.right{right:25%;top:55%}
 /* Percentage offsets are relative to the stick, so travel scales with it. */
 .gp-knob{position:absolute;width:44%;height:44%;border-radius:50%;
   background:var(--accent-solid);
@@ -3218,7 +3218,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-stick-label{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);
   color:var(--text-3);font:600 9px ui-monospace,monospace;white-space:nowrap}
 
-.gp-dpad{position:absolute;left:11%;top:22%;width:20%;aspect-ratio:1}
+.gp-dpad{position:absolute;left:11%;top:20%;width:20%;aspect-ratio:1}
 .gp-dpad span{position:absolute;background:var(--bg);border:1px solid var(--line-2);
   border-radius:3px;transition:background .12s ease}
 .gp-dpad span.on{background:var(--accent-solid);border-color:var(--accent-solid)}
@@ -3227,7 +3227,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-dpad .left{top:34%;bottom:34%;left:0;width:34%}
 .gp-dpad .right{top:34%;bottom:34%;right:0;width:34%}
 
-.gp-face{position:absolute;right:9%;top:22%;width:22%;aspect-ratio:1}
+.gp-face{position:absolute;right:9%;top:18%;width:22%;aspect-ratio:1}
 .gp-face span{position:absolute;width:42%;height:42%;border-radius:50%;
   display:flex;align-items:center;justify-content:center;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
@@ -3239,7 +3239,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-face span.down,.gp-shoulder.down{background:var(--accent-solid);
   border-color:var(--accent-solid);color:var(--accent-fg)}
 
-.gp-center{position:absolute;left:50%;top:30%;transform:translateX(-50%);
+.gp-center{position:absolute;left:50%;top:26%;transform:translateX(-50%);
   display:flex;gap:6px;align-items:center}
 .gp-center span{padding:3px 8px;border-radius:999px;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
