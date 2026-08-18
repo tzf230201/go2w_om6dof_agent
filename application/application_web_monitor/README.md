@@ -111,6 +111,7 @@ mapping carries over and it gets its own profile:
 | A / Y | pitch up / down |
 | B / X | roll right / left |
 | RT / LT | yaw clockwise / counter-clockwise |
+| D-pad up / down | speed up / down, 10 points per press |
 | RB / LB | grip / release |
 | Start | go to READY |
 | Back | back to rest |
@@ -123,8 +124,11 @@ joints with controls whose labels would then be lying about what they do.
 equivalents put a dialog in the way; a gamepad button cannot. Rest wins if both
 are pressed in the same poll, being the safer destination.
 
-Because the triggers steer yaw, the pad no longer sets the speed factor — the
-dashboard slider governs it and stays editable while the pad is selected.
+Speed moved to the D-pad when the triggers took over yaw. It steps once per
+press rather than ramping while held, which is repeatable and cannot drift, and
+it clamps at 15% and 200%. The card shows the current value, amber above 100%,
+refreshed at the 10 Hz pad poll rather than the 1 Hz status poll. The dashboard
+slider stays in sync and remains editable.
 
 Pitch and roll come from buttons, so they step at a fixed rate rather than
 being proportional; the speed factor still scales them. Squeezing both triggers

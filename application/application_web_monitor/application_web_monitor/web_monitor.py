@@ -108,6 +108,10 @@ PAD_RIGHT_X, PAD_RIGHT_Y = 3, 4
 # The triggers steer yaw, so the pad no longer sets the speed factor; the
 # dashboard slider governs it while the pad is the control source.
 PAD_TRIGGER_YAW_CCW, PAD_TRIGGER_YAW_CW = 2, 5
+PAD_DPAD_X, PAD_DPAD_Y = 6, 7
+# The D-pad is digital, so speed steps once per press instead of
+# ramping while held: repeatable, and it cannot drift.
+JOG_SPEED_STEP = 0.10
 PAD_PITCH_UP_BUTTON = 1     # A
 PAD_PITCH_DOWN_BUTTON = 4   # Y
 PAD_ROLL_RIGHT_BUTTON = 2   # B
@@ -764,6 +768,7 @@ class MonitorNode(Node):
         self._airbus_rest_pressed = False
         self._gamepad_gripper_pressed = set()
         self._gamepad_pose_pressed = set()
+        self._gamepad_speed_dir = 0
         self.pub_perception_target = self.create_publisher(
             String, "/om6dof_perception/set_target", 10
         )
@@ -1571,6 +1576,16 @@ class MonitorNode(Node):
 
         # Squeezing both cancels, rather than letting one arbitrarily win.
         yaw = trigger(PAD_TRIGGER_YAW_CW) - trigger(PAD_TRIGGER_YAW_CCW)
+
+        # D-pad up/down nudges the shared speed factor on the press edge.
+        dpad_y = float(axes[PAD_DPAD_Y]) if math.isfinite(float(axes[PAD_DPAD_Y])) else 0.0
+        direction = -1 if dpad_y <= -0.5 else (1 if dpad_y >= 0.5 else 0)
+        if direction and direction != self._gamepad_speed_dir:
+            step = JOG_SPEED_STEP if direction < 0 else -JOG_SPEED_STEP
+            self.jog_speed_scale = max(
+                JOG_SPEED_MIN, min(JOG_SPEED_MAX, self.jog_speed_scale + step)
+            )
+        self._gamepad_speed_dir = direction
 
         # The published frame is [X, Y, Z, roll, pitch, yaw].
         # Screen coordinates run down-positive, so pushing a stick forward or
@@ -3287,6 +3302,14 @@ ul.nodes li:last-child{border-bottom:0}
 }
 .gp-center span.down{background:var(--accent-solid);border-color:var(--accent-solid);
   color:var(--accent-fg)}
+.gp-speed{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+  padding-bottom:8px;border-bottom:1px solid var(--line)}
+.gp-speed span{color:var(--text-3);font:600 10px ui-monospace,monospace;letter-spacing:.08em}
+.gp-speed strong{color:var(--text);font:600 20px ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+/* Above the tuned rate is an abnormal state, coloured like the slider. */
+.gp-speed strong.fast{color:var(--warn-fg)}
+.gp-speed-hint{margin:6px 0 14px;color:var(--text-3);font-size:11px}
 @media(max-width:520px){.gp-stick-label{font-size:7.5px;bottom:-14px}}
 
 /* ---------- robot visualizer ----------
@@ -3398,6 +3421,7 @@ document.querySelectorAll('#gamepad [data-btn]').forEach(b=>b.classList.toggle('
 const dx=at(6),dy=at(7),lit=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',on)};
 lit('gamepad_dpad_left',dx<-0.5);lit('gamepad_dpad_right',dx>0.5);
 lit('gamepad_dpad_up',dy<-0.5);lit('gamepad_dpad_down',dy>0.5);
+const sp=document.getElementById('gamepad_speed');if(sp&&typeof d.jog_speed_scale==='number'){const pct=Math.round(d.jog_speed_scale*100);sp.textContent=pct+'%';sp.classList.toggle('fast',pct>100)}
 const list=document.getElementById('gamepad_axes');
 if(list)list.replaceChildren(...axes.map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>'+(PAD_AXIS_NAMES[i]||('Axis '+(i+1)))+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}
 async function pollGamepad(){if(!document.getElementById('gamepad'))return;try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderGamepad(d);if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_pose');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){const device=document.getElementById('gamepad_device');if(device)device.textContent='Gamepad monitor unavailable'}}
@@ -4553,7 +4577,7 @@ def render_page(
             </div>
           </div>
         </div>
-        <div class="flightstick-readout"><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed; clicking a stick lights its ring.</p></div>
+        <div class="flightstick-readout"><div class="gp-speed"><span>SPEED</span><strong id="gamepad_speed">100%</strong></div><p class="gp-speed-hint">D-pad up / down</p><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed; clicking a stick lights its ring.</p></div>
       </div>
       <p class="small"><b>This pad commands the arm</b> when Control source is set to it,
       in CARTESIAN or CYLINDRICAL mode. Left stick moves forward/back and left/right;
@@ -5132,7 +5156,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json({"connected": False, "error": str(exc)}, 500)
             if self.path.startswith("/gamepad.json"):
                 try:
-                    return self._send_json(node.gamepad.snapshot())
+                    payload = node.gamepad.snapshot()
+                    # Carried here too so the card's speed readout tracks the
+                    # D-pad at the 10 Hz pad poll, not the 1 Hz status poll.
+                    payload["jog_speed_scale"] = round(float(node.jog_speed_scale), 3)
+                    return self._send_json(payload)
                 except Exception as exc:
                     return self._send_json({"connected": False, "error": str(exc)}, 500)
             if self.path.startswith("/status.json"):
