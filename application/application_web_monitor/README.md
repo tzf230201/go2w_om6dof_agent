@@ -184,7 +184,7 @@ buttons, last button event, and normalized axis values.
 | 4 | grip (close) | press edge |
 | 3 | release (open) | press edge |
 | 8 | toggle REST/READY | press edge |
-| 1 / 2 | Z up / down | held |
+| 2 / 1 | Z up / down | held |
 
 Axis 2 carries **pitch**, proportionally. Buttons 1 and 2 step **Z** instead.
 These were the other way round originally; pitch is the finer of the two to

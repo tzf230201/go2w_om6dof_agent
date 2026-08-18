@@ -72,8 +72,8 @@ JSIOCGBUTTONS = 0x80016A12
 # a remap never means hunting bare integers through the request handlers.
 # Buttons 1 and 2 step Z; axis 2 carries pitch. They were the other way
 # round until the operator swapped them, so pitch is proportional now.
-LIFT_UP_BUTTON = 1
-LIFT_DOWN_BUTTON = 2
+LIFT_UP_BUTTON = 2
+LIFT_DOWN_BUTTON = 1
 RELEASE_BUTTON = 3
 GRIP_BUTTON = 4
 REST_BUTTON = 8
