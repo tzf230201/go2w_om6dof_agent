@@ -137,10 +137,10 @@ cancels to zero, as does pressing A with Y or B with X.
 Grip and release sit on the shoulders because A and Y carry pitch. The right
 stick's sideways axis is unassigned.
 
-Neither trigger pressed is the tuned rate; the triggers are read as absolute
-positions rather than integrated, so the speed never drifts. On the `xpad`
-driver they rest at `-1.0` and reach `+1.0`, which is why the code normalises
-with `(value + 1) / 2` — a driver that rested at `0.0` instead would need that
+The triggers are read as absolute positions, so yaw follows the squeeze
+directly and returns to zero when released. On the `xpad` driver they rest at
+`-1.0` and reach `+1.0`, which is why the code normalises with
+`(value + 1) / 2` — a driver that rested at `0.0` instead would need that
 changed. Pushing a stick forward drives its axis positive, matching the TCA and
 the web joystick.
 
@@ -165,8 +165,8 @@ doubles as the way to discover which physical button carries which number
 before remapping.
 
 The buttons and axes are named at module scope as `PAD_*` in `web_monitor.py`;
-remap there. Gripper and REST/READY handling is shared with the TCA through
-`_gripper_from_stick` and `_rest_from_stick`, so the guards and the commanded
+remap there. Gripper handling is shared with the TCA through
+`_gripper_from_stick`, so the guards and the commanded
 gripper positions cannot drift apart between the two controllers.
 
 ## Thrustmaster TCA flight-stick monitor
