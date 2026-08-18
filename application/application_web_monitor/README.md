@@ -108,8 +108,8 @@ mapping carries over and it gets its own profile:
 |---|---|
 | Left stick | forward/back and left/right |
 | Right stick, vertical | up/down |
+| Right stick, sideways | roll right / left |
 | A / Y | pitch up / down |
-| B / X | roll right / left |
 | RT / LT | yaw clockwise / counter-clockwise |
 | D-pad up / down | speed up / down, 10 points per press |
 | RB / LB | grip / release |
@@ -130,12 +130,13 @@ it clamps at 15% and 200%. The card shows the current value, amber above 100%,
 refreshed at the 10 Hz pad poll rather than the 1 Hz status poll. The dashboard
 slider stays in sync and remains editable.
 
-Pitch and roll come from buttons, so they step at a fixed rate rather than
-being proportional; the speed factor still scales them. Squeezing both triggers
-cancels to zero, as does pressing A with Y or B with X.
+Roll moved off the B and X buttons onto the right stick's sideways axis, so it
+is proportional; both axes of that stick read independently, and a diagonal push
+lifts and rolls at once. Pitch is still stepped from buttons, scaled by the
+speed factor. Squeezing both triggers cancels to zero, as does pressing A with Y.
 
-Grip and release sit on the shoulders because A and Y carry pitch. The right
-stick's sideways axis is unassigned.
+Grip and release sit on the shoulders because A and Y carry pitch. B and X are
+now unassigned.
 
 The triggers are read as absolute positions, so yaw follows the squeeze
 directly and returns to zero when released. On the `xpad` driver they rest at

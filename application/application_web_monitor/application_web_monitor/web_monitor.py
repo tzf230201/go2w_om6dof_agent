@@ -120,8 +120,6 @@ PAD_DPAD_X, PAD_DPAD_Y = 6, 7
 JOG_SPEED_STEP = 0.10
 PAD_PITCH_UP_BUTTON = 1     # A
 PAD_PITCH_DOWN_BUTTON = 4   # Y
-PAD_ROLL_RIGHT_BUTTON = 2   # B
-PAD_ROLL_LEFT_BUTTON = 3    # X
 # Grip sits on the shoulders because A and B carry pitch.
 PAD_GRIP_BUTTON = 6     # RB
 PAD_RELEASE_BUTTON = 5  # LB
@@ -1604,7 +1602,7 @@ class MonitorNode(Node):
         step = lambda plus, minus: float((1 if plus in held else 0)
                                          - (1 if minus in held else 0))
         pitch = step(PAD_PITCH_UP_BUTTON, PAD_PITCH_DOWN_BUTTON)
-        roll = step(PAD_ROLL_RIGHT_BUTTON, PAD_ROLL_LEFT_BUTTON)
+        roll = axis(PAD_RIGHT_X)   # right stick sideways, proportional
         if normalized == "CARTESIAN":
             linear = (0.03, 0.03, 0.03)
         else:
@@ -3396,7 +3394,7 @@ const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
 function controlSource(){return document.getElementById('control_source')?.value||'web'}
-function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode)?'Logitech F710 active · '+armControlMode+'. Sticks move and lift, A/Y pitch, B/X roll, LT/RT yaw.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode)?'Logitech F710 active · '+armControlMode+'. Left stick moves, right stick lifts and rolls, A/Y pitch, LT/RT yaw.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
@@ -4587,11 +4585,10 @@ def render_page(
       </div>
       <p class="small"><b>This pad commands the arm</b> when Control source is set to it,
       in CARTESIAN or CYLINDRICAL mode. Left stick moves forward/back and left/right;
-      right stick moves up/down. A and Y pitch, B and X roll, LT and RT yaw CCW/CW.
+      right stick moves up/down and rolls sideways. A and Y pitch, LT and RT yaw CCW/CW.
       RB grips, LB releases. <b>Start goes to READY and Back returns to rest — both move
       the arm immediately, with no confirmation.</b> Streaming control must be enabled
-      first. Speed comes from the dashboard slider. The right stick's sideways axis and
-      the remaining buttons are unassigned.</p>
+      first. D-pad up/down sets speed. B, X and the remaining buttons are unassigned.</p>
     </div>
     """
 
