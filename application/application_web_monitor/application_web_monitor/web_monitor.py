@@ -3198,14 +3198,17 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-shoulder.left{left:8.5%}
 .gp-shoulder.right{right:8.5%}
 
-.gp-stick{position:absolute;width:24%;aspect-ratio:1;border-radius:50%;
+.gp-stick{position:absolute;width:22%;aspect-ratio:1;border-radius:50%;
   background:var(--bg);border:1px solid var(--line-2);
   transition:border-color .15s ease,box-shadow .15s ease}
 .gp-stick::before,.gp-stick::after{content:"";position:absolute;background:var(--line-2)}
 .gp-stick::before{left:50%;top:12%;bottom:12%;width:1px}
 .gp-stick::after{top:50%;left:12%;right:12%;height:1px}
-.gp-stick.left{left:9%;top:34%}
-.gp-stick.right{right:22%;top:60%}
+/* F710 uses the DualShock arrangement: D-pad up on the left shoulder side,
+   both sticks together along the bottom. It is not the Xbox layout, where
+   the left stick and the D-pad trade places. */
+.gp-stick.left{left:25%;top:58%}
+.gp-stick.right{right:25%;top:58%}
 /* Percentage offsets are relative to the stick, so travel scales with it. */
 .gp-knob{position:absolute;width:44%;height:44%;border-radius:50%;
   background:var(--accent-solid);
@@ -3215,7 +3218,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-stick-label{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);
   color:var(--text-3);font:600 9px ui-monospace,monospace;white-space:nowrap}
 
-.gp-dpad{position:absolute;left:26%;top:62%;width:20%;aspect-ratio:1}
+.gp-dpad{position:absolute;left:11%;top:22%;width:20%;aspect-ratio:1}
 .gp-dpad span{position:absolute;background:var(--bg);border:1px solid var(--line-2);
   border-radius:3px;transition:background .12s ease}
 .gp-dpad span.on{background:var(--accent-solid);border-color:var(--accent-solid)}
@@ -3224,7 +3227,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-dpad .left{top:34%;bottom:34%;left:0;width:34%}
 .gp-dpad .right{top:34%;bottom:34%;right:0;width:34%}
 
-.gp-face{position:absolute;right:7%;top:30%;width:26%;aspect-ratio:1}
+.gp-face{position:absolute;right:9%;top:22%;width:22%;aspect-ratio:1}
 .gp-face span{position:absolute;width:42%;height:42%;border-radius:50%;
   display:flex;align-items:center;justify-content:center;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
@@ -3236,7 +3239,7 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-face span.down,.gp-shoulder.down{background:var(--accent-solid);
   border-color:var(--accent-solid);color:var(--accent-fg)}
 
-.gp-center{position:absolute;left:50%;top:36%;transform:translateX(-50%);
+.gp-center{position:absolute;left:50%;top:30%;transform:translateX(-50%);
   display:flex;gap:6px;align-items:center}
 .gp-center span{padding:3px 8px;border-radius:999px;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
