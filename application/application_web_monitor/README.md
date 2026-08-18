@@ -121,6 +121,17 @@ with `(value + 1) / 2` — a driver that rested at `0.0` instead would need that
 changed. Pushing a stick forward drives its axis positive, matching the TCA and
 the web joystick.
 
+A **Logitech F710 gamepad** card under *Audio & input devices* mirrors the pad
+live: both sticks as knobs on their crosshairs, LT and RT as bars that fill as
+they are squeezed, all eleven buttons lit by their printed names (A, B, X, Y,
+LB, RB, Back, Start, Logo, LS, RS) rather than by index, and a named axis
+readout. Like the flight-stick card it is driven by custom properties, so CSS
+owns the geometry and the card can be resized without touching JavaScript.
+
+The card renders whether or not the pad is the selected control source, so it
+doubles as the way to discover which physical button carries which number
+before remapping.
+
 The buttons and axes are named at module scope as `PAD_*` in `web_monitor.py`;
 remap there. Gripper and REST/READY handling is shared with the TCA through
 `_gripper_from_stick` and `_rest_from_stick`, so the guards and the commanded

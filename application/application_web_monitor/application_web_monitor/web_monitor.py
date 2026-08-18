@@ -109,6 +109,12 @@ PAD_TRIGGER_SLOWER, PAD_TRIGGER_FASTER = 2, 5
 PAD_GRIP_BUTTON = 1     # A
 PAD_RELEASE_BUTTON = 2  # B
 PAD_REST_BUTTON = 8     # Start
+# Face labels in Linux button order, so the card shows what is printed on the
+# pad rather than making the operator count indices.
+PAD_BUTTON_LABELS = ("A", "B", "X", "Y", "LB", "RB",
+                     "Back", "Start", "Logo", "LS", "RS")
+PAD_AXIS_LABELS = ("L stick X", "L stick Y", "LT", "R stick X",
+                   "R stick Y", "RT", "D-pad X", "D-pad Y")
 
 
 class FlightStickMonitor:
@@ -3161,6 +3167,40 @@ ul.nodes li:last-child{border-bottom:0}
   transition:background .15s ease,color .15s ease}
 .fs-btn.down{background:var(--accent-solid);color:var(--accent-fg)}
 
+/* ---------- Logitech F710 viewer ----------
+   Same contract as the flight stick: JS publishes unitless values through
+   custom properties and CSS owns every dimension, so nothing here has to
+   change when the card is resized. */
+.gp-stage{display:grid;grid-template-columns:38px minmax(0,1fr) 38px;gap:16px;
+  align-items:center;padding:26px 18px 20px;border-radius:16px;background:var(--surface-2)}
+.gp-sticks{display:flex;gap:18px;justify-content:center;align-items:center}
+.gp-stick{position:relative;width:100%;max-width:116px;aspect-ratio:1;border-radius:50%;
+  background:var(--surface);border:1px solid var(--line-2)}
+.gp-stick::before,.gp-stick::after{content:"";position:absolute;background:var(--line-2)}
+.gp-stick::before{left:50%;top:8px;bottom:8px;width:1px}
+.gp-stick::after{top:50%;left:8px;right:8px;height:1px}
+.gp-knob{position:absolute;left:50%;top:50%;width:30px;height:30px;border-radius:50%;
+  background:var(--accent-solid);
+  transform:translate(calc(-50% + var(--x,0) * 38px),calc(-50% + var(--y,0) * 38px));
+  transition:transform .09s linear}
+.gp-stick-label{position:absolute;left:50%;bottom:-19px;transform:translateX(-50%);
+  color:var(--text-3);font:600 10px ui-monospace,monospace;white-space:nowrap}
+.gp-trigger{position:relative;height:150px;border-radius:11px;background:var(--surface);
+  border:1px solid var(--line-2);overflow:hidden}
+.gp-trigger-fill{position:absolute;left:0;right:0;bottom:0;background:var(--accent-solid);
+  height:calc(var(--t,0) * 100%);transition:height .09s linear}
+.gp-trigger-label{position:absolute;left:50%;top:-9px;transform:translate(-50%,-100%);
+  color:var(--text-3);font:600 10px ui-monospace,monospace}
+.gp-buttons{display:grid;grid-template-columns:repeat(auto-fit,minmax(58px,1fr));
+  gap:8px;margin-top:22px}
+.gp-btn{display:flex;align-items:center;justify-content:center;min-height:36px;
+  border-radius:10px;background:var(--surface-2);color:var(--text-3);
+  font:500 12px ui-monospace,SFMono-Regular,Menlo,monospace;
+  transition:background .15s ease,color .15s ease}
+.gp-btn.down{background:var(--accent-solid);color:var(--accent-fg)}
+@media(max-width:560px){.gp-stage{grid-template-columns:32px minmax(0,1fr) 32px;gap:10px}
+  .gp-sticks{gap:10px}}
+
 /* ---------- robot visualizer ----------
    The canvas paints its own dark scene, so this viewport stays dark in
    both themes and its overlay text is pinned to a light colour. */
@@ -3255,7 +3295,20 @@ async function sendAirbusJog(){if(controlSource()!=='airbus'||!webJogAllowed)ret
 async function sendAirbusGripper(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_gripper',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus gripper command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus gripper connection lost.','bad',6000)}}
 async function sendAirbusRest(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_rest',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Rest-position request rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus rest-position connection lost.','bad',6000)}}
 async function sendGamepad(path,extra){const body=new URLSearchParams(Object.assign({csrf:document.getElementById('web_jog')?.dataset.csrf||''},extra||{}));try{const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Gamepad command rejected.','bad',6000)}}catch(_error){showActionNotice('Gamepad connection lost.','bad',6000)}}
-async function pollGamepad(){const readout=document.getElementById('gamepad_state');try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();if(readout)readout.textContent=d.connected?(d.device+' ('+d.path+') · '+(d.buttons||[]).length+' held'):'No gamepad detected';if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_rest');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){if(readout)readout.textContent='Gamepad monitor unavailable'}}
+const PAD_AXIS_NAMES=['L stick X','L stick Y','LT','R stick X','R stick Y','RT','D-pad X','D-pad Y'];
+function renderGamepad(d){const axes=d.axes||[];const at=i=>Math.max(-1,Math.min(1,Number(axes[i]||0)));
+const set=(id,prop,val)=>{const el=document.getElementById(id);if(el)el.style.setProperty(prop,val)};
+set('gamepad_left_knob','--x',at(0));set('gamepad_left_knob','--y',at(1));
+set('gamepad_right_knob','--x',at(3));set('gamepad_right_knob','--y',at(4));
+// Triggers rest at -1 and reach +1, so the fill fraction is (v+1)/2.
+set('gamepad_lt','--t',(at(2)+1)/2);set('gamepad_rt','--t',(at(5)+1)/2);
+const device=document.getElementById('gamepad_device'),event=document.getElementById('gamepad_event');
+if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No gamepad detected in /dev/input/js*';
+if(event)event.textContent=d.last_event||'';
+document.querySelectorAll('#gamepad [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));
+const list=document.getElementById('gamepad_axes');
+if(list)list.replaceChildren(...axes.map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>'+(PAD_AXIS_NAMES[i]||('Axis '+(i+1)))+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}
+async function pollGamepad(){if(!document.getElementById('gamepad'))return;try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderGamepad(d);if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_rest');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){const device=document.getElementById('gamepad_device');if(device)device.textContent='Gamepad monitor unavailable'}}
 async function pollFlightStick(){const card=document.getElementById('flight_stick');if(!card)return;try{const r=await fetch('/flight_stick.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderFlightAnalog(d.axes||[]);sendAirbusJog();sendAirbusGripper();sendAirbusRest();const device=document.getElementById('flight_stick_device'),event=document.getElementById('flight_stick_event'),axes=document.getElementById('flight_stick_axes');if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No joystick detected in /dev/input/js*';if(event)event.textContent=d.last_event||'';document.querySelectorAll('#flight_stick [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));if(axes){axes.replaceChildren(...(d.axes||[]).map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>Axis '+(i+1)+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}}catch(_error){const device=document.getElementById('flight_stick_device');if(device)device.textContent='Flight-stick monitor unavailable';}}
 
 // Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
@@ -4317,7 +4370,6 @@ def render_page(
             <span class="mono" id="jog_speed_value">100%</span>
           </div>
           <p class="mono jogreadout" id="web_jog_readout">Loading controller state…</p>
-          <p class="small" id="gamepad_state">Scanning for a gamepad…</p>
         </div>
       </div>
       <p class="small jogwarning">Hold-to-move only. Release the stick to stop.
@@ -4359,6 +4411,45 @@ def render_page(
       Button 4 grips, Button 3 releases, Button 8 toggles REST/READY, Buttons 1 and 2 step pitch.
       The axes jog the arm in CARTESIAN and CYLINDRICAL modes. Every one of these needs streaming
       control enabled first; the remaining buttons are unassigned and only shown.</p>
+    </div>
+    """
+
+    gamepad_html = """
+    <div class="card" id="gamepad">
+      <h2>🎮 Logitech F710 gamepad</h2>
+      <p class="small" id="gamepad_device">Scanning /dev/input/js*…</p>
+      <p class="mono" id="gamepad_event">No button event yet</p>
+      <div class="flightstick-layout">
+        <div class="gp-stage">
+          <div class="gp-trigger" aria-label="Left trigger, slows the arm">
+            <span class="gp-trigger-label">LT</span>
+            <span class="gp-trigger-fill" id="gamepad_lt"></span>
+          </div>
+          <div class="gp-sticks">
+            <div class="gp-stick" aria-label="Left stick, axis pair 1">
+              <span class="gp-knob" id="gamepad_left_knob"></span>
+              <span class="gp-stick-label">PAIR 1</span>
+            </div>
+            <div class="gp-stick" aria-label="Right stick, axis pair 2">
+              <span class="gp-knob" id="gamepad_right_knob"></span>
+              <span class="gp-stick-label">PAIR 2</span>
+            </div>
+          </div>
+          <div class="gp-trigger" aria-label="Right trigger, speeds the arm up">
+            <span class="gp-trigger-label">RT</span>
+            <span class="gp-trigger-fill" id="gamepad_rt"></span>
+          </div>
+        </div>
+        <div class="flightstick-readout"><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed.</p></div>
+      </div>
+      <div class="gp-buttons">""" + "".join(
+        '<span class="gp-btn" data-btn="%d">%s</span>' % (index + 1, label)
+        for index, label in enumerate(PAD_BUTTON_LABELS)
+    ) + """</div>
+      <p class="small"><b>This pad commands the arm</b> when Control source is set to it.
+      Left stick drives axis pair 1 and the right stick pair 2; RT speeds up to 200% and LT
+      slows to 15%; A grips, B releases, Start toggles REST/READY. Streaming control must be
+      enabled first; the remaining buttons are unassigned and only shown.</p>
     </div>
     """
 
@@ -4680,7 +4771,7 @@ def render_page(
          [perception_html if om else "", ddgng_html if om else ""]),
         ("Audio &amp; input devices",
          "Microphone pipeline and connected input hardware.",
-         [audio_html, flight_stick_html]),
+         [audio_html, flight_stick_html, gamepad_html]),
     ])
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
