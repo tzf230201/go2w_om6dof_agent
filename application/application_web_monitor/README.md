@@ -122,11 +122,20 @@ changed. Pushing a stick forward drives its axis positive, matching the TCA and
 the web joystick.
 
 A **Logitech F710 gamepad** card under *Audio & input devices* mirrors the pad
-live: both sticks as knobs on their crosshairs, LT and RT as bars that fill as
-they are squeezed, all eleven buttons lit by their printed names (A, B, X, Y,
-LB, RB, Back, Start, Logo, LS, RS) rather than by index, and a named axis
-readout. Like the flight-stick card it is driven by custom properties, so CSS
-owns the geometry and the card can be resized without touching JavaScript.
+live, drawn in the physical layout so a control can be found by where the thumb
+already is rather than by counting indices: sticks labelled `ANALOG KIRI` and
+`ANALOG KANAN`, the D-pad, the A/B/X/Y diamond, LB/RB shoulders, LT/RT bars
+that fill as they are squeezed, and Back/Logo/Start down the middle. Clicking a
+stick (LS/RS) lights that stick's ring, so all eleven buttons are represented
+without a separate list.
+
+The D-pad is lit from axes 7 and 8 rather than from buttons, because that is
+how XInput reports it.
+
+Everything is positioned in percentages inside one `aspect-ratio` box, so the
+pad scales as a unit and no element can drift outside the body. Stick travel is
+a percentage of the stick itself, which is why resizing never needs a
+JavaScript change.
 
 The card renders whether or not the pad is the selected control source, so it
 doubles as the way to discover which physical button carries which number

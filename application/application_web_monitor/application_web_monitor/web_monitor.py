@@ -3171,35 +3171,79 @@ ul.nodes li:last-child{border-bottom:0}
    Same contract as the flight stick: JS publishes unitless values through
    custom properties and CSS owns every dimension, so nothing here has to
    change when the card is resized. */
-.gp-stage{display:grid;grid-template-columns:38px minmax(0,1fr) 38px;gap:16px;
-  align-items:center;padding:26px 18px 20px;border-radius:16px;background:var(--surface-2)}
-.gp-sticks{display:flex;gap:18px;justify-content:center;align-items:center}
-.gp-stick{position:relative;width:100%;max-width:116px;aspect-ratio:1;border-radius:50%;
-  background:var(--surface);border:1px solid var(--line-2)}
+/* Laid out like the physical pad: sticks, D-pad and face diamond sit where
+   the thumbs expect them. Everything is positioned in percentages inside one
+   aspect-ratio box, so the whole pad scales as a unit and no element can
+   drift out of the body the way absolutely positioned pixels would. */
+.gp-stage{padding:20px 16px 16px;border-radius:16px;background:var(--surface-2)}
+.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.5;margin:0 auto}
+.gp-shell{position:absolute;left:0;right:0;top:16%;bottom:0;border-radius:22% 22% 30% 30%/
+  32% 32% 44% 44%;background:var(--surface);border:1px solid var(--line-2)}
+
+.gp-trigger{position:absolute;top:0;width:23%;height:7%;border-radius:7px;
+  background:var(--surface);border:1px solid var(--line-2);overflow:hidden}
+.gp-trigger.left{left:7%}
+.gp-trigger.right{right:7%}
+.gp-trigger-fill{position:absolute;left:0;top:0;bottom:0;background:var(--accent-solid);
+  width:calc(var(--t,0) * 100%);transition:width .09s linear}
+.gp-trigger-label{position:absolute;top:50%;transform:translateY(-50%);
+  color:var(--text-3);font:600 10px ui-monospace,monospace;z-index:1}
+.gp-trigger.left .gp-trigger-label{left:7px}
+.gp-trigger.right .gp-trigger-label{right:7px}
+
+.gp-shoulder{position:absolute;top:9%;width:20%;height:6.5%;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;background:var(--surface);
+  border:1px solid var(--line-2);color:var(--text-3);
+  font:600 10px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+.gp-shoulder.left{left:8.5%}
+.gp-shoulder.right{right:8.5%}
+
+.gp-stick{position:absolute;width:24%;aspect-ratio:1;border-radius:50%;
+  background:var(--bg);border:1px solid var(--line-2);
+  transition:border-color .15s ease,box-shadow .15s ease}
 .gp-stick::before,.gp-stick::after{content:"";position:absolute;background:var(--line-2)}
-.gp-stick::before{left:50%;top:8px;bottom:8px;width:1px}
-.gp-stick::after{top:50%;left:8px;right:8px;height:1px}
-.gp-knob{position:absolute;left:50%;top:50%;width:30px;height:30px;border-radius:50%;
+.gp-stick::before{left:50%;top:12%;bottom:12%;width:1px}
+.gp-stick::after{top:50%;left:12%;right:12%;height:1px}
+.gp-stick.left{left:9%;top:34%}
+.gp-stick.right{right:22%;top:60%}
+/* Percentage offsets are relative to the stick, so travel scales with it. */
+.gp-knob{position:absolute;width:44%;height:44%;border-radius:50%;
   background:var(--accent-solid);
-  transform:translate(calc(-50% + var(--x,0) * 38px),calc(-50% + var(--y,0) * 38px));
-  transition:transform .09s linear}
-.gp-stick-label{position:absolute;left:50%;bottom:-19px;transform:translateX(-50%);
-  color:var(--text-3);font:600 10px ui-monospace,monospace;white-space:nowrap}
-.gp-trigger{position:relative;height:150px;border-radius:11px;background:var(--surface);
-  border:1px solid var(--line-2);overflow:hidden}
-.gp-trigger-fill{position:absolute;left:0;right:0;bottom:0;background:var(--accent-solid);
-  height:calc(var(--t,0) * 100%);transition:height .09s linear}
-.gp-trigger-label{position:absolute;left:50%;top:-9px;transform:translate(-50%,-100%);
-  color:var(--text-3);font:600 10px ui-monospace,monospace}
-.gp-buttons{display:grid;grid-template-columns:repeat(auto-fit,minmax(58px,1fr));
-  gap:8px;margin-top:22px}
-.gp-btn{display:flex;align-items:center;justify-content:center;min-height:36px;
-  border-radius:10px;background:var(--surface-2);color:var(--text-3);
-  font:500 12px ui-monospace,SFMono-Regular,Menlo,monospace;
-  transition:background .15s ease,color .15s ease}
-.gp-btn.down{background:var(--accent-solid);color:var(--accent-fg)}
-@media(max-width:560px){.gp-stage{grid-template-columns:32px minmax(0,1fr) 32px;gap:10px}
-  .gp-sticks{gap:10px}}
+  left:calc(50% + var(--x,0) * 27%);top:calc(50% + var(--y,0) * 27%);
+  transform:translate(-50%,-50%);transition:left .09s linear,top .09s linear}
+.gp-stick.down{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent)}
+.gp-stick-label{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);
+  color:var(--text-3);font:600 9px ui-monospace,monospace;white-space:nowrap}
+
+.gp-dpad{position:absolute;left:26%;top:62%;width:20%;aspect-ratio:1}
+.gp-dpad span{position:absolute;background:var(--bg);border:1px solid var(--line-2);
+  border-radius:3px;transition:background .12s ease}
+.gp-dpad span.on{background:var(--accent-solid);border-color:var(--accent-solid)}
+.gp-dpad .up{left:34%;right:34%;top:0;height:34%}
+.gp-dpad .down{left:34%;right:34%;bottom:0;height:34%}
+.gp-dpad .left{top:34%;bottom:34%;left:0;width:34%}
+.gp-dpad .right{top:34%;bottom:34%;right:0;width:34%}
+
+.gp-face{position:absolute;right:7%;top:30%;width:26%;aspect-ratio:1}
+.gp-face span{position:absolute;width:42%;height:42%;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;background:var(--bg);
+  border:1px solid var(--line-2);color:var(--text-3);
+  font:700 10px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+.gp-face .y{left:29%;top:0}
+.gp-face .x{left:0;top:29%}
+.gp-face .b{right:0;top:29%}
+.gp-face .a{left:29%;bottom:0}
+.gp-face span.down,.gp-shoulder.down{background:var(--accent-solid);
+  border-color:var(--accent-solid);color:var(--accent-fg)}
+
+.gp-center{position:absolute;left:50%;top:36%;transform:translateX(-50%);
+  display:flex;gap:6px;align-items:center}
+.gp-center span{padding:3px 8px;border-radius:999px;background:var(--bg);
+  border:1px solid var(--line-2);color:var(--text-3);
+  font:600 9px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+.gp-center span.down{background:var(--accent-solid);border-color:var(--accent-solid);
+  color:var(--accent-fg)}
+@media(max-width:520px){.gp-stick-label{font-size:8px;bottom:-15px}}
 
 /* ---------- robot visualizer ----------
    The canvas paints its own dark scene, so this viewport stays dark in
@@ -3306,6 +3350,10 @@ const device=document.getElementById('gamepad_device'),event=document.getElement
 if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No gamepad detected in /dev/input/js*';
 if(event)event.textContent=d.last_event||'';
 document.querySelectorAll('#gamepad [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));
+// The D-pad reports as axes 7 and 8, not buttons, so it is lit from signs.
+const dx=at(6),dy=at(7),lit=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',on)};
+lit('gamepad_dpad_left',dx<-0.5);lit('gamepad_dpad_right',dx>0.5);
+lit('gamepad_dpad_up',dy<-0.5);lit('gamepad_dpad_down',dy>0.5);
 const list=document.getElementById('gamepad_axes');
 if(list)list.replaceChildren(...axes.map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>'+(PAD_AXIS_NAMES[i]||('Axis '+(i+1)))+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}
 async function pollGamepad(){if(!document.getElementById('gamepad'))return;try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderGamepad(d);if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_rest');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){const device=document.getElementById('gamepad_device');if(device)device.textContent='Gamepad monitor unavailable'}}
@@ -4421,31 +4469,47 @@ def render_page(
       <p class="mono" id="gamepad_event">No button event yet</p>
       <div class="flightstick-layout">
         <div class="gp-stage">
-          <div class="gp-trigger" aria-label="Left trigger, slows the arm">
-            <span class="gp-trigger-label">LT</span>
-            <span class="gp-trigger-fill" id="gamepad_lt"></span>
-          </div>
-          <div class="gp-sticks">
-            <div class="gp-stick" aria-label="Left stick, axis pair 1">
+          <div class="gp-body" aria-label="Live view of the gamepad">
+            <div class="gp-trigger left" aria-label="Left trigger, slows the arm">
+              <span class="gp-trigger-fill" id="gamepad_lt"></span>
+              <span class="gp-trigger-label">LT</span>
+            </div>
+            <div class="gp-trigger right" aria-label="Right trigger, speeds the arm up">
+              <span class="gp-trigger-fill" id="gamepad_rt"></span>
+              <span class="gp-trigger-label">RT</span>
+            </div>
+            <div class="gp-shoulder left" data-btn="5">LB</div>
+            <div class="gp-shoulder right" data-btn="6">RB</div>
+            <div class="gp-shell"></div>
+            <div class="gp-stick left" data-btn="10" aria-label="Left analog stick">
               <span class="gp-knob" id="gamepad_left_knob"></span>
-              <span class="gp-stick-label">PAIR 1</span>
+              <span class="gp-stick-label">ANALOG KIRI</span>
             </div>
-            <div class="gp-stick" aria-label="Right stick, axis pair 2">
+            <div class="gp-stick right" data-btn="11" aria-label="Right analog stick">
               <span class="gp-knob" id="gamepad_right_knob"></span>
-              <span class="gp-stick-label">PAIR 2</span>
+              <span class="gp-stick-label">ANALOG KANAN</span>
             </div>
-          </div>
-          <div class="gp-trigger" aria-label="Right trigger, speeds the arm up">
-            <span class="gp-trigger-label">RT</span>
-            <span class="gp-trigger-fill" id="gamepad_rt"></span>
+            <div class="gp-dpad" aria-label="D-pad">
+              <span class="up" id="gamepad_dpad_up"></span>
+              <span class="down" id="gamepad_dpad_down"></span>
+              <span class="left" id="gamepad_dpad_left"></span>
+              <span class="right" id="gamepad_dpad_right"></span>
+            </div>
+            <div class="gp-face">
+              <span class="y" data-btn="4">Y</span>
+              <span class="x" data-btn="3">X</span>
+              <span class="b" data-btn="2">B</span>
+              <span class="a" data-btn="1">A</span>
+            </div>
+            <div class="gp-center">
+              <span data-btn="7">Back</span>
+              <span data-btn="9">Logo</span>
+              <span data-btn="8">Start</span>
+            </div>
           </div>
         </div>
-        <div class="flightstick-readout"><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed.</p></div>
+        <div class="flightstick-readout"><h4>Axis live</h4><div id="gamepad_axes">No axes</div><p class="flightstick-legend">Blue = pressed. Triggers fill as they are squeezed; clicking a stick lights its ring.</p></div>
       </div>
-      <div class="gp-buttons">""" + "".join(
-        '<span class="gp-btn" data-btn="%d">%s</span>' % (index + 1, label)
-        for index, label in enumerate(PAD_BUTTON_LABELS)
-    ) + """</div>
       <p class="small"><b>This pad commands the arm</b> when Control source is set to it.
       Left stick drives axis pair 1 and the right stick pair 2; RT speeds up to 200% and LT
       slows to 15%; A grips, B releases, Start toggles REST/READY. Streaming control must be
