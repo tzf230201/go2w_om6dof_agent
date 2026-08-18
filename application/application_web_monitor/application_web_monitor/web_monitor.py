@@ -3173,7 +3173,7 @@ ul.nodes li:last-child{border-bottom:0}
    aspect-ratio box, so the whole pad scales as a unit. JS only publishes
    unitless values through custom properties; CSS owns all geometry. */
 .gp-stage{padding:18px 16px 22px;border-radius:16px;background:var(--surface-2)}
-.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.34;margin:0 auto}
+.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.34;margin:0 auto;container-type:inline-size}
 .gp-shell{position:absolute;left:0;top:13%;width:100%;height:87%;overflow:visible}
 .gp-shell path{fill:var(--surface);stroke:var(--line-2);stroke-width:.7;
   vector-effect:non-scaling-stroke}
@@ -3240,12 +3240,19 @@ ul.nodes li:last-child{border-bottom:0}
 .gp-center{position:absolute;left:50%;top:34%;transform:translateX(-50%);z-index:2;
   display:flex;gap:5px;align-items:center}
 .gp-center span{padding:2px 7px;border-radius:999px;background:var(--bg);
-  border:1px solid var(--line-2);color:var(--text-3);
+  border:1px solid var(--line-2);color:var(--text-3);white-space:nowrap;
   font:600 8px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+/* These pills carry text, so they were the one part sized in pixels while
+   everything else scaled in percentages -- at narrow widths they kept their
+   size and ran into the D-pad and the X button. Container units make them
+   shrink with the pad; the px rule above stays as the fallback. */
+@container (min-width: 1px){
+  .gp-center{gap:1.2cqw}
+  .gp-center span{padding:.5cqw 1.6cqw;font-size:2.1cqw}
+}
 .gp-center span.down{background:var(--accent-solid);border-color:var(--accent-solid);
   color:var(--accent-fg)}
-@media(max-width:520px){.gp-stick-label{font-size:7.5px;bottom:-14px}
-  .gp-center span{padding:2px 5px;font-size:7px}}
+@media(max-width:520px){.gp-stick-label{font-size:7.5px;bottom:-14px}}
 
 /* ---------- robot visualizer ----------
    The canvas paints its own dark scene, so this viewport stays dark in
