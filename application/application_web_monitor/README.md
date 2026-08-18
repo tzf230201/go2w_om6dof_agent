@@ -108,22 +108,30 @@ mapping carries over and it gets its own profile:
 |---|---|
 | Left stick | forward/back and left/right |
 | Right stick, vertical | up/down |
-| Y / A | pitch up / down |
+| A / Y | pitch up / down |
 | B / X | roll right / left |
+| RT / LT | yaw clockwise / counter-clockwise |
 | RB / LB | grip / release |
-| Start | toggle REST/READY |
-| RT | speed up, toward 200% |
-| LT | speed down, toward 15% |
+| Start | go to READY |
+| Back | back to rest |
 
 The mapping is Cartesian by nature, so the pad is accepted only in
 **CARTESIAN** and **CYLINDRICAL** modes. JOINT is refused rather than driving
 joints with controls whose labels would then be lying about what they do.
 
-Two inputs are deliberately unassigned: **yaw**, and the right stick's
-sideways axis. Pitch and roll come from buttons, so they step at a fixed rate
-rather than being proportional — the speed throttle still scales them.
+**Start and Back move the arm with no confirmation.** Their dashboard
+equivalents put a dialog in the way; a gamepad button cannot. Rest wins if both
+are pressed in the same poll, being the safer destination.
 
-Grip and release sit on the shoulders because A and B carry pitch and roll.
+Because the triggers steer yaw, the pad no longer sets the speed factor — the
+dashboard slider governs it and stays editable while the pad is selected.
+
+Pitch and roll come from buttons, so they step at a fixed rate rather than
+being proportional; the speed factor still scales them. Squeezing both triggers
+cancels to zero, as does pressing A with Y or B with X.
+
+Grip and release sit on the shoulders because A and Y carry pitch. The right
+stick's sideways axis is unassigned.
 
 Neither trigger pressed is the tuned rate; the triggers are read as absolute
 positions rather than integrated, so the speed never drifts. On the `xpad`

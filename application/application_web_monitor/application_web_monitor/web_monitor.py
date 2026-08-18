@@ -105,15 +105,18 @@ GAMEPAD_NAME_HINTS = ("logitech", "logicool", "f710", "gamepad", "xbox", "x-box"
 # 0..1 fraction; the sticks self-centre inside the existing 0.08 deadzone.
 PAD_LEFT_X, PAD_LEFT_Y = 0, 1
 PAD_RIGHT_X, PAD_RIGHT_Y = 3, 4
-PAD_TRIGGER_SLOWER, PAD_TRIGGER_FASTER = 2, 5
-PAD_PITCH_UP_BUTTON = 4     # Y
-PAD_PITCH_DOWN_BUTTON = 1   # A
+# The triggers steer yaw, so the pad no longer sets the speed factor; the
+# dashboard slider governs it while the pad is the control source.
+PAD_TRIGGER_YAW_CCW, PAD_TRIGGER_YAW_CW = 2, 5
+PAD_PITCH_UP_BUTTON = 1     # A
+PAD_PITCH_DOWN_BUTTON = 4   # Y
 PAD_ROLL_RIGHT_BUTTON = 2   # B
 PAD_ROLL_LEFT_BUTTON = 3    # X
-# Grip moved to the shoulders because A and B now carry pitch and roll.
+# Grip sits on the shoulders because A and B carry pitch.
 PAD_GRIP_BUTTON = 6     # RB
 PAD_RELEASE_BUTTON = 5  # LB
-PAD_REST_BUTTON = 8     # Start
+PAD_READY_BUTTON = 8    # Start
+PAD_REST_BUTTON = 7     # Back
 # Face labels in Linux button order, so the card shows what is printed on the
 # pad rather than making the operator count indices.
 PAD_BUTTON_LABELS = ("A", "B", "X", "Y", "LB", "RB",
@@ -760,7 +763,7 @@ class MonitorNode(Node):
         self._airbus_gripper_pressed = set()
         self._airbus_rest_pressed = False
         self._gamepad_gripper_pressed = set()
-        self._gamepad_rest_pressed = False
+        self._gamepad_pose_pressed = set()
         self.pub_perception_target = self.create_publisher(
             String, "/om6dof_perception/set_target", 10
         )
@@ -1496,11 +1499,28 @@ class MonitorNode(Node):
             PAD_GRIP_BUTTON, PAD_RELEASE_BUTTON, "Gamepad",
         )
 
-    def request_gamepad_rest(self) -> Tuple[bool, str]:
-        """Toggle REST/READY from Start on the F710."""
-        return self._rest_from_stick(
-            self.gamepad, "_gamepad_rest_pressed", PAD_REST_BUTTON, "Gamepad",
-        )
+    def request_gamepad_pose(self) -> Tuple[bool, str]:
+        """Start commands READY; Back returns to the rest pose.
+
+        Both fire on the press edge. Unlike the dashboard buttons these carry
+        no confirmation dialog, so the arm moves the moment one is hit. Rest
+        wins when both land in the same poll, being the safer destination.
+        """
+        state = self.gamepad.snapshot()
+        if not state["connected"]:
+            self._gamepad_pose_pressed = set()
+            return False, "Gamepad pose rejected: gamepad is disconnected."
+        pressed = set(state["buttons"]) & {PAD_READY_BUTTON, PAD_REST_BUTTON}
+        new_presses = pressed - self._gamepad_pose_pressed
+        self._gamepad_pose_pressed = pressed
+        if PAD_REST_BUTTON in new_presses:
+            return self.request_rest_position()
+        if PAD_READY_BUTTON in new_presses:
+            if self.remote_enabled is not True:
+                return False, "READY rejected: enable streaming control first."
+            self.set_operation_mode("READY")
+            return True, "READY requested from the gamepad."
+        return True, ""
 
     def request_gamepad_jog(self, mode: str) -> Tuple[bool, str]:
         """Map the F710's two sticks to one bounded OM6DOF velocity frame.
@@ -1549,13 +1569,8 @@ class MonitorNode(Node):
                 return 0.0
             return max(0.0, min(1.0, (value + 1.0) / 2.0))
 
-        faster = trigger(PAD_TRIGGER_FASTER)
-        slower = trigger(PAD_TRIGGER_SLOWER)
-        self.jog_speed_scale = max(JOG_SPEED_MIN, min(JOG_SPEED_MAX, (
-            JOG_SPEED_DEFAULT
-            + (JOG_SPEED_MAX - JOG_SPEED_DEFAULT) * faster
-            - (JOG_SPEED_DEFAULT - JOG_SPEED_MIN) * slower
-        )))
+        # Squeezing both cancels, rather than letting one arbitrarily win.
+        yaw = trigger(PAD_TRIGGER_YAW_CW) - trigger(PAD_TRIGGER_YAW_CCW)
 
         # The published frame is [X, Y, Z, roll, pitch, yaw].
         # Screen coordinates run down-positive, so pushing a stick forward or
@@ -1569,7 +1584,6 @@ class MonitorNode(Node):
                                          - (1 if minus in held else 0))
         pitch = step(PAD_PITCH_UP_BUTTON, PAD_PITCH_DOWN_BUTTON)
         roll = step(PAD_ROLL_RIGHT_BUTTON, PAD_ROLL_LEFT_BUTTON)
-        # Yaw is deliberately unmapped: the right stick's X axis is free.
         if normalized == "CARTESIAN":
             linear = (0.03, 0.03, 0.03)
         else:
@@ -1582,7 +1596,7 @@ class MonitorNode(Node):
             lift * linear[2] * scale,
             roll * angular * scale,
             pitch * angular * scale,
-            0.0,
+            yaw * angular * scale,
         ]
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
@@ -3353,14 +3367,14 @@ const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
 function controlSource(){return document.getElementById('control_source')?.value||'web'}
-function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode)?'Logitech F710 active · '+armControlMode+'. Left stick moves, right stick lifts, Y/A pitch, B/X roll.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode)?'Logitech F710 active · '+armControlMode+'. Sticks move and lift, A/Y pitch, B/X roll, LT/RT yaw.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
 let jogSpeedDragging=false;
 function sendJogSpeed(percent){const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',scale:String(percent/100)});fetch('/jog_speed',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()}).then(async r=>{if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Speed change rejected.','bad',5000)}}).catch(()=>showActionNotice('Speed change failed.','bad',5000))}
-function speedOwner(){const s=controlSource();return s==='airbus'?' · LIFT':s==='gamepad'?' · LT/RT':''}
+function speedOwner(){return controlSource()==='airbus'?' · LIFT':''}
 function paintJogSpeed(percent,suffix){const label=document.getElementById('jog_speed_value');if(!label)return;label.textContent=percent+'%'+(suffix||'');label.classList.toggle('fast',percent>100)}
 function syncJogSpeed(d){const slider=document.getElementById('jog_speed');if(!slider)return;const suffix=speedOwner();slider.disabled=!!suffix;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);paintJogSpeed(percent,suffix)}
 function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{paintJogSpeed(Number(speed.value),'')});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
@@ -3386,7 +3400,7 @@ lit('gamepad_dpad_left',dx<-0.5);lit('gamepad_dpad_right',dx>0.5);
 lit('gamepad_dpad_up',dy<-0.5);lit('gamepad_dpad_down',dy>0.5);
 const list=document.getElementById('gamepad_axes');
 if(list)list.replaceChildren(...axes.map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>'+(PAD_AXIS_NAMES[i]||('Axis '+(i+1)))+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}
-async function pollGamepad(){if(!document.getElementById('gamepad'))return;try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderGamepad(d);if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_rest');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){const device=document.getElementById('gamepad_device');if(device)device.textContent='Gamepad monitor unavailable'}}
+async function pollGamepad(){if(!document.getElementById('gamepad'))return;try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderGamepad(d);if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_pose');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){const device=document.getElementById('gamepad_device');if(device)device.textContent='Gamepad monitor unavailable'}}
 async function pollFlightStick(){const card=document.getElementById('flight_stick');if(!card)return;try{const r=await fetch('/flight_stick.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderFlightAnalog(d.axes||[]);sendAirbusJog();sendAirbusGripper();sendAirbusRest();const device=document.getElementById('flight_stick_device'),event=document.getElementById('flight_stick_event'),axes=document.getElementById('flight_stick_axes');if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No joystick detected in /dev/input/js*';if(event)event.textContent=d.last_event||'';document.querySelectorAll('#flight_stick [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));if(axes){axes.replaceChildren(...(d.axes||[]).map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>Axis '+(i+1)+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}}catch(_error){const device=document.getElementById('flight_stick_device');if(device)device.textContent='Flight-stick monitor unavailable';}}
 
 // Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
@@ -4543,10 +4557,11 @@ def render_page(
       </div>
       <p class="small"><b>This pad commands the arm</b> when Control source is set to it,
       in CARTESIAN or CYLINDRICAL mode. Left stick moves forward/back and left/right;
-      right stick moves up/down. Y and A pitch, B and X roll. RB grips, LB releases,
-      Start toggles REST/READY. RT speeds up to 200% and LT slows to 15%.
-      Streaming control must be enabled first. Yaw and the right stick's sideways axis
-      are unassigned; the remaining buttons are only shown.</p>
+      right stick moves up/down. A and Y pitch, B and X roll, LT and RT yaw CCW/CW.
+      RB grips, LB releases. <b>Start goes to READY and Back returns to rest — both move
+      the arm immediately, with no confirmation.</b> Streaming control must be enabled
+      first. Speed comes from the dashboard slider. The right stick's sideways axis and
+      the remaining buttons are unassigned.</p>
     </div>
     """
 
@@ -5416,7 +5431,7 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                 except (UnicodeError, ValueError) as exc:
                     return self._send_json({"ok": False, "message": str(exc)}, 400)
                 return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
-            if self.path in ("/gamepad_jog", "/gamepad_gripper", "/gamepad_rest"):
+            if self.path in ("/gamepad_jog", "/gamepad_gripper", "/gamepad_pose"):
                 try:
                     form = self._read_form(512)
                     if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
@@ -5426,7 +5441,7 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     elif self.path == "/gamepad_gripper":
                         ok, message = node.request_gamepad_gripper()
                     else:
-                        ok, message = node.request_gamepad_rest()
+                        ok, message = node.request_gamepad_pose()
                 except (UnicodeError, ValueError) as exc:
                     return self._send_json({"ok": False, "message": str(exc)}, 400)
                 return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
