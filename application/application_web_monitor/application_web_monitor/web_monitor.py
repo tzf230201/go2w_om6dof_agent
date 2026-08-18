@@ -3168,85 +3168,84 @@ ul.nodes li:last-child{border-bottom:0}
 .fs-btn.down{background:var(--accent-solid);color:var(--accent-fg)}
 
 /* ---------- Logitech F710 viewer ----------
-   Same contract as the flight stick: JS publishes unitless values through
-   custom properties and CSS owns every dimension, so nothing here has to
-   change when the card is resized. */
-/* Laid out like the physical pad: sticks, D-pad and face diamond sit where
-   the thumbs expect them. Everything is positioned in percentages inside one
-   aspect-ratio box, so the whole pad scales as a unit and no element can
-   drift out of the body the way absolutely positioned pixels would. */
-.gp-stage{padding:20px 16px 24px;border-radius:16px;background:var(--surface-2)}
-.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.35;margin:0 auto}
-.gp-shell{position:absolute;left:0;right:0;top:16%;bottom:0;border-radius:22% 22% 30% 30%/
-  32% 32% 44% 44%;background:var(--surface);border:1px solid var(--line-2)}
+   Drawn in the pad's real proportions: an SVG silhouette carries the body
+   and grips, and every control is placed over it in percentages of one
+   aspect-ratio box, so the whole pad scales as a unit. JS only publishes
+   unitless values through custom properties; CSS owns all geometry. */
+.gp-stage{padding:18px 16px 22px;border-radius:16px;background:var(--surface-2)}
+.gp-body{position:relative;width:100%;max-width:430px;aspect-ratio:1.34;margin:0 auto}
+.gp-shell{position:absolute;left:0;top:13%;width:100%;height:87%;overflow:visible}
+.gp-shell path{fill:var(--surface);stroke:var(--line-2);stroke-width:.7;
+  vector-effect:non-scaling-stroke}
 
-.gp-trigger{position:absolute;top:0;width:23%;height:7%;border-radius:7px;
+.gp-trigger{position:absolute;top:0;width:21%;height:6%;border-radius:6px 6px 3px 3px;
   background:var(--surface);border:1px solid var(--line-2);overflow:hidden}
-.gp-trigger.left{left:7%}
-.gp-trigger.right{right:7%}
+.gp-trigger.left{left:11%}
+.gp-trigger.right{right:11%}
 .gp-trigger-fill{position:absolute;left:0;top:0;bottom:0;background:var(--accent-solid);
   width:calc(var(--t,0) * 100%);transition:width .09s linear}
-.gp-trigger-label{position:absolute;top:50%;transform:translateY(-50%);
-  color:var(--text-3);font:600 10px ui-monospace,monospace;z-index:1}
-.gp-trigger.left .gp-trigger-label{left:7px}
-.gp-trigger.right .gp-trigger-label{right:7px}
+.gp-trigger-label{position:absolute;top:50%;transform:translateY(-50%);z-index:1;
+  color:var(--text-3);font:600 9px ui-monospace,monospace}
+.gp-trigger.left .gp-trigger-label{left:6px}
+.gp-trigger.right .gp-trigger-label{right:6px}
 
-.gp-shoulder{position:absolute;top:9%;width:20%;height:6.5%;border-radius:6px;
+/* Shoulders overlap the shell's top edge, the way they sit on the real pad. */
+.gp-shoulder{position:absolute;top:8.5%;width:19%;height:6%;border-radius:5px;
   display:flex;align-items:center;justify-content:center;background:var(--surface);
-  border:1px solid var(--line-2);color:var(--text-3);
-  font:600 10px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
-.gp-shoulder.left{left:8.5%}
-.gp-shoulder.right{right:8.5%}
+  border:1px solid var(--line-2);color:var(--text-3);z-index:2;
+  font:600 9px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+.gp-shoulder.left{left:12%}
+.gp-shoulder.right{right:12%}
 
-.gp-stick{position:absolute;width:22%;aspect-ratio:1;border-radius:50%;
+.gp-stick{position:absolute;width:20%;aspect-ratio:1;border-radius:50%;z-index:2;
   background:var(--bg);border:1px solid var(--line-2);
   transition:border-color .15s ease,box-shadow .15s ease}
 .gp-stick::before,.gp-stick::after{content:"";position:absolute;background:var(--line-2)}
-.gp-stick::before{left:50%;top:12%;bottom:12%;width:1px}
-.gp-stick::after{top:50%;left:12%;right:12%;height:1px}
-/* F710 uses the DualShock arrangement: D-pad up on the left shoulder side,
-   both sticks together along the bottom. It is not the Xbox layout, where
-   the left stick and the D-pad trade places. */
-.gp-stick.left{left:25%;top:55%}
-.gp-stick.right{right:25%;top:55%}
-/* Percentage offsets are relative to the stick, so travel scales with it. */
-.gp-knob{position:absolute;width:44%;height:44%;border-radius:50%;
+.gp-stick::before{left:50%;top:14%;bottom:14%;width:1px}
+.gp-stick::after{top:50%;left:14%;right:14%;height:1px}
+.gp-stick.left{left:26%;top:57.5%}
+.gp-stick.right{right:26%;top:57.5%}
+/* Offsets are percentages of the stick, so travel scales with the pad. */
+.gp-knob{position:absolute;width:46%;height:46%;border-radius:50%;
   background:var(--accent-solid);
-  left:calc(50% + var(--x,0) * 27%);top:calc(50% + var(--y,0) * 27%);
+  left:calc(50% + var(--x,0) * 26%);top:calc(50% + var(--y,0) * 26%);
   transform:translate(-50%,-50%);transition:left .09s linear,top .09s linear}
-.gp-stick.down{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent)}
-.gp-stick-label{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);
-  color:var(--text-3);font:600 9px ui-monospace,monospace;white-space:nowrap}
+.gp-stick.down{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.gp-stick-label{position:absolute;left:50%;bottom:-16px;transform:translateX(-50%);
+  color:var(--text-3);font:600 8.5px ui-monospace,monospace;white-space:nowrap}
 
-.gp-dpad{position:absolute;left:11%;top:20%;width:20%;aspect-ratio:1}
+/* Arms overlap the hub so the D-pad reads as one cross, not four squares. */
+.gp-dpad{position:absolute;left:12%;top:31%;width:17%;aspect-ratio:1;z-index:2}
 .gp-dpad span{position:absolute;background:var(--bg);border:1px solid var(--line-2);
-  border-radius:3px;transition:background .12s ease}
+  transition:background .12s ease}
+.gp-dpad .up{left:33%;right:33%;top:0;height:56%;border-radius:4px 4px 0 0}
+.gp-dpad .down{left:33%;right:33%;bottom:0;height:56%;border-radius:0 0 4px 4px}
+.gp-dpad .left{top:33%;bottom:33%;left:0;width:56%;border-radius:4px 0 0 4px}
+.gp-dpad .right{top:33%;bottom:33%;right:0;width:56%;border-radius:0 4px 4px 0}
+.gp-dpad .hub{left:33%;right:33%;top:33%;bottom:33%;border:0;background:var(--bg)}
 .gp-dpad span.on{background:var(--accent-solid);border-color:var(--accent-solid)}
-.gp-dpad .up{left:34%;right:34%;top:0;height:34%}
-.gp-dpad .down{left:34%;right:34%;bottom:0;height:34%}
-.gp-dpad .left{top:34%;bottom:34%;left:0;width:34%}
-.gp-dpad .right{top:34%;bottom:34%;right:0;width:34%}
 
-.gp-face{position:absolute;right:9%;top:18%;width:22%;aspect-ratio:1}
-.gp-face span{position:absolute;width:42%;height:42%;border-radius:50%;
+.gp-face{position:absolute;right:12%;top:27%;width:21%;aspect-ratio:1;z-index:2}
+.gp-face span{position:absolute;width:40%;height:40%;border-radius:50%;
   display:flex;align-items:center;justify-content:center;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
-  font:700 10px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
-.gp-face .y{left:29%;top:0}
-.gp-face .x{left:0;top:29%}
-.gp-face .b{right:0;top:29%}
-.gp-face .a{left:29%;bottom:0}
+  font:700 9px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+.gp-face .y{left:30%;top:0}
+.gp-face .x{left:0;top:30%}
+.gp-face .b{right:0;top:30%}
+.gp-face .a{left:30%;bottom:0}
 .gp-face span.down,.gp-shoulder.down{background:var(--accent-solid);
   border-color:var(--accent-solid);color:var(--accent-fg)}
 
-.gp-center{position:absolute;left:50%;top:26%;transform:translateX(-50%);
-  display:flex;gap:6px;align-items:center}
-.gp-center span{padding:3px 8px;border-radius:999px;background:var(--bg);
+.gp-center{position:absolute;left:50%;top:34%;transform:translateX(-50%);z-index:2;
+  display:flex;gap:5px;align-items:center}
+.gp-center span{padding:2px 7px;border-radius:999px;background:var(--bg);
   border:1px solid var(--line-2);color:var(--text-3);
-  font:600 9px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
+  font:600 8px ui-monospace,monospace;transition:background .15s ease,color .15s ease}
 .gp-center span.down{background:var(--accent-solid);border-color:var(--accent-solid);
   color:var(--accent-fg)}
-@media(max-width:520px){.gp-stick-label{font-size:8px;bottom:-15px}}
+@media(max-width:520px){.gp-stick-label{font-size:7.5px;bottom:-14px}
+  .gp-center span{padding:2px 5px;font-size:7px}}
 
 /* ---------- robot visualizer ----------
    The canvas paints its own dark scene, so this viewport stays dark in
@@ -4483,7 +4482,7 @@ def render_page(
             </div>
             <div class="gp-shoulder left" data-btn="5">LB</div>
             <div class="gp-shoulder right" data-btn="6">RB</div>
-            <div class="gp-shell"></div>
+            <svg class="gp-shell" viewBox="0 0 100 65" preserveAspectRatio="none" aria-hidden="true"><path d="M23 3 H77 C89 3 96 11 96.5 23 C97 37 94 54 85.5 60 C78 65 70 62 66 55 L59 43 H41 L34 55 C30 62 22 65 14.5 60 C6 54 3 37 3.5 23 C4 11 11 3 23 3 Z"/></svg>
             <div class="gp-stick left" data-btn="10" aria-label="Left analog stick">
               <span class="gp-knob" id="gamepad_left_knob"></span>
               <span class="gp-stick-label">ANALOG KIRI</span>
@@ -4493,6 +4492,7 @@ def render_page(
               <span class="gp-stick-label">ANALOG KANAN</span>
             </div>
             <div class="gp-dpad" aria-label="D-pad">
+              <span class="hub"></span>
               <span class="up" id="gamepad_dpad_up"></span>
               <span class="down" id="gamepad_dpad_down"></span>
               <span class="left" id="gamepad_dpad_left"></span>
