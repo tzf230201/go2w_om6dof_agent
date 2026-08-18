@@ -94,11 +94,36 @@ JOG_SPEED_MIN = 0.15  # never zero: a dead lever would look like a broken stick
 JOG_SPEED_MAX = 2.00
 JOG_SPEED_DEFAULT = 1.00  # start at the tuned rate, never at the new ceiling
 
+# Two very different sticks can be plugged in at once, so each reader matches
+# its own device by USB product name. Every mapping below is per-device: the
+# TCA's axis order and 17 buttons mean nothing on an 11-button gamepad.
+TCA_NAME_HINTS = ("thrustmaster", "tca", "airbus")
+GAMEPAD_NAME_HINTS = ("logitech", "logicool", "f710", "gamepad", "xbox", "x-box")
+
+# Logitech F710 in XInput mode, as the Linux xpad driver presents it.
+# Triggers rest at -1.0 and reach +1.0 fully pressed, so (v + 1) / 2 is the
+# 0..1 fraction; the sticks self-centre inside the existing 0.08 deadzone.
+PAD_LEFT_X, PAD_LEFT_Y = 0, 1
+PAD_RIGHT_X, PAD_RIGHT_Y = 3, 4
+PAD_TRIGGER_SLOWER, PAD_TRIGGER_FASTER = 2, 5
+PAD_GRIP_BUTTON = 1     # A
+PAD_RELEASE_BUTTON = 2  # B
+PAD_REST_BUTTON = 8     # Start
+
 
 class FlightStickMonitor:
-    """Non-blocking reader for a Linux joystick device, for diagnostics only."""
+    """Non-blocking reader for one Linux joystick device.
 
-    def __init__(self) -> None:
+    ``match`` selects the device by USB product name. ``accept_unknown`` keeps
+    the original behaviour of adopting an unrecognised stick, which is what
+    lets a TCA whose firmware reports an odd name keep working; ``avoid``
+    stops that fallback from stealing a device another reader owns.
+    """
+
+    def __init__(self, match=TCA_NAME_HINTS, accept_unknown=True, avoid=()) -> None:
+        self._match = tuple(word.lower() for word in match)
+        self._avoid = tuple(word.lower() for word in avoid)
+        self._accept_unknown = bool(accept_unknown)
         self._lock = threading.Lock()
         self._fd = None
         self._path = ""
@@ -129,28 +154,34 @@ class FlightStickMonitor:
         self._fd = None
         self._path = ""
 
+    def _hit(self, name: str, words) -> bool:
+        lowered = name.lower()
+        return any(word in lowered for word in words)
+
     def _scan(self) -> None:
         self._last_scan = time.monotonic()
         candidates = sorted(glob.glob("/dev/input/js*"))
         selected = None
         selected_path = ""
         selected_name = ""
-        # Prefer the Airbus stick, while retaining any joystick as a useful
-        # fallback when its USB product name differs by firmware/driver.
         for path in candidates:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
             except OSError:
                 continue
             name = self._name_for(fd)
-            if selected is None or any(word in name.lower() for word in ("thrustmaster", "tca", "airbus")):
+            if self._hit(name, self._match):
+                # A name match is decisive; stop looking.
                 if selected is not None:
                     os.close(selected)
                 selected, selected_path, selected_name = fd, path, name
-                if any(word in name.lower() for word in ("thrustmaster", "tca", "airbus")):
-                    break
-            else:
-                os.close(fd)
+                break
+            if (self._accept_unknown and selected is None
+                    and not self._hit(name, self._avoid)):
+                # Hold it as a fallback but keep scanning for a real match.
+                selected, selected_path, selected_name = fd, path, name
+                continue
+            os.close(fd)
         if selected is None:
             self._close()
             return
@@ -580,7 +611,14 @@ class MonitorNode(Node):
         super().__init__("go2w_web_monitor")
         self.flash = ""  # one-shot banner (e.g. kill result), shown then cleared
         self.csrf_token = secrets.token_urlsafe(32)
-        self.flight_stick = FlightStickMonitor()
+        # The TCA reader still adopts an unrecognised stick, but must not
+        # swallow the gamepad; the gamepad reader only ever takes a match.
+        self.flight_stick = FlightStickMonitor(
+            match=TCA_NAME_HINTS, accept_unknown=True, avoid=GAMEPAD_NAME_HINTS
+        )
+        self.gamepad = FlightStickMonitor(
+            match=GAMEPAD_NAME_HINTS, accept_unknown=False
+        )
         self._arm_restart_lock = threading.Lock()
         self._arm_restart_phase = "idle"
         self._arm_restart_message = ""
@@ -710,6 +748,8 @@ class MonitorNode(Node):
         )
         self._airbus_gripper_pressed = set()
         self._airbus_rest_pressed = False
+        self._gamepad_gripper_pressed = set()
+        self._gamepad_rest_pressed = False
         self.pub_perception_target = self.create_publisher(
             String, "/om6dof_perception/set_target", 10
         )
@@ -1363,43 +1403,45 @@ class MonitorNode(Node):
         self.pub_web_jog.publish(Float64MultiArray(data=values))
         return True, ""
 
-    def request_airbus_gripper(self) -> Tuple[bool, str]:
-        """Button 4 grips, Button 3 releases; each fires on its press edge.
+    def _gripper_from_stick(self, monitor, held_attr: str, grip_button: int,
+                            release_button: int, source: str) -> Tuple[bool, str]:
+        """Drive the gripper from one controller's press edges.
 
-        Holding a button no longer matters, so the gripper keeps its last
-        commanded state instead of springing open when a finger lifts.
+        Shared by both sticks so the guards and the commanded positions can
+        never drift apart between them; only the buttons differ.
         """
-        state = self.flight_stick.snapshot()
+        state = monitor.snapshot()
         if not state["connected"]:
-            self._airbus_gripper_pressed.clear()
-            return False, "Airbus gripper rejected: flight stick is disconnected."
-        pressed = set(state["buttons"]) & {GRIP_BUTTON, RELEASE_BUTTON}
-        new_presses = pressed - self._airbus_gripper_pressed
-        self._airbus_gripper_pressed = pressed
+            setattr(self, held_attr, set())
+            return False, f"{source} gripper rejected: controller is disconnected."
+        pressed = set(state["buttons"]) & {grip_button, release_button}
+        new_presses = pressed - getattr(self, held_attr)
+        setattr(self, held_attr, pressed)
         # Gripping wins if both edges land inside the same poll.
-        if GRIP_BUTTON in new_presses:
+        if grip_button in new_presses:
             command = "close"
-        elif RELEASE_BUTTON in new_presses:
+        elif release_button in new_presses:
             command = "open"
         else:
             return True, ""
         if self.remote_enabled is not True:
-            return False, "Airbus gripper rejected: enable streaming control first."
+            return False, f"{source} gripper rejected: enable streaming control first."
         if not self.airbus_gripper_client.server_is_ready():
-            return False, "Airbus gripper rejected: action server is unavailable."
+            return False, f"{source} gripper rejected: action server is unavailable."
         goal = GripperCommand.Goal()
         goal.command.position = 0.019 if command == "open" else -0.010
         goal.command.max_effort = 0.0
         self.airbus_gripper_client.send_goal_async(goal)
-        self.gripper_state = f"{command.upper()} requested from Airbus TCA"
+        self.gripper_state = f"{command.upper()} requested from {source}"
         return True, ""
 
-    def request_airbus_rest(self) -> Tuple[bool, str]:
-        """Toggle REST/READY from the Button 8 press edge."""
-        state = self.flight_stick.snapshot()
-        pressed = bool(state["connected"] and REST_BUTTON in set(state["buttons"]))
-        was_pressed = self._airbus_rest_pressed
-        self._airbus_rest_pressed = pressed
+    def _rest_from_stick(self, monitor, held_attr: str, rest_button: int,
+                         source: str) -> Tuple[bool, str]:
+        """Toggle REST/READY from one controller's press edge."""
+        state = monitor.snapshot()
+        pressed = bool(state["connected"] and rest_button in set(state["buttons"]))
+        was_pressed = getattr(self, held_attr)
+        setattr(self, held_attr, pressed)
         if not pressed or was_pressed:
             return True, ""
         with self._pickup_lock:
@@ -1415,9 +1457,108 @@ class MonitorNode(Node):
                 return False, "REST/READY toggle rejected: search is active."
             if self._arm_restart_phase == "restarting":
                 return False, "REST/READY toggle rejected: the stack is restarting."
-            self.rest_message = "REST/READY toggle requested from Airbus TCA."
+            self.rest_message = f"REST/READY toggle requested from {source}."
         self.set_operation_mode("TOGGLE_REST_READY")
         return True, self.rest_message
+
+    def request_airbus_gripper(self) -> Tuple[bool, str]:
+        """Button 4 grips, Button 3 releases; each fires on its press edge.
+
+        Holding a button no longer matters, so the gripper keeps its last
+        commanded state instead of springing open when a finger lifts.
+        """
+        return self._gripper_from_stick(
+            self.flight_stick, "_airbus_gripper_pressed",
+            GRIP_BUTTON, RELEASE_BUTTON, "Airbus TCA",
+        )
+
+    def request_airbus_rest(self) -> Tuple[bool, str]:
+        """Toggle REST/READY from the Button 8 press edge."""
+        return self._rest_from_stick(
+            self.flight_stick, "_airbus_rest_pressed", REST_BUTTON, "Airbus TCA",
+        )
+
+    def request_gamepad_gripper(self) -> Tuple[bool, str]:
+        """A grips, B releases on the F710."""
+        return self._gripper_from_stick(
+            self.gamepad, "_gamepad_gripper_pressed",
+            PAD_GRIP_BUTTON, PAD_RELEASE_BUTTON, "Gamepad",
+        )
+
+    def request_gamepad_rest(self) -> Tuple[bool, str]:
+        """Toggle REST/READY from Start on the F710."""
+        return self._rest_from_stick(
+            self.gamepad, "_gamepad_rest_pressed", PAD_REST_BUTTON, "Gamepad",
+        )
+
+    def request_gamepad_jog(self, mode: str) -> Tuple[bool, str]:
+        """Map the F710's two sticks to one bounded OM6DOF velocity frame.
+
+        Left stick drives axis pair 1, right stick pair 2. The triggers are
+        the speed throttle: neither pressed is the tuned rate, RT boosts
+        toward JOG_SPEED_MAX and LT slows toward JOG_SPEED_MIN.
+        """
+        normalized = str(mode).strip().upper()
+        if normalized not in ("JOINT", "CARTESIAN", "CYLINDRICAL"):
+            return False, "Gamepad control rejected: invalid operation mode."
+        with self._pickup_lock:
+            if self.remote_enabled is not True:
+                return False, "Gamepad control rejected: enable streaming control first."
+            if self.control_mode != normalized:
+                return False, (
+                    f"Gamepad control rejected: controller is in "
+                    f"{self.control_mode or 'UNKNOWN'}, not {normalized}."
+                )
+            if self.arm_target_active or self.pickup_busy:
+                return False, "Gamepad control rejected: an arm target or pickup is active."
+            if self.object_tracking_active or self.object_search_active:
+                return False, "Gamepad control rejected: tracking or search is active."
+            if self._arm_restart_phase == "restarting":
+                return False, "Gamepad control rejected: the OM6DOF stack is restarting."
+        state = self.gamepad.snapshot()
+        if not state["connected"]:
+            return False, "Gamepad control rejected: gamepad is disconnected."
+        axes = list(state["axes"])
+        axes.extend([0.0] * max(0, 8 - len(axes)))
+
+        def axis(index: int) -> float:
+            value = float(axes[index])
+            if not math.isfinite(value):
+                return 0.0
+            value = max(-1.0, min(1.0, value))
+            return value if abs(value) >= 0.08 else 0.0
+
+        def trigger(index: int) -> float:
+            # Rests at -1.0 and reaches +1.0 fully pressed on the xpad driver.
+            value = float(axes[index])
+            if not math.isfinite(value):
+                return 0.0
+            return max(0.0, min(1.0, (value + 1.0) / 2.0))
+
+        faster = trigger(PAD_TRIGGER_FASTER)
+        slower = trigger(PAD_TRIGGER_SLOWER)
+        self.jog_speed_scale = max(JOG_SPEED_MIN, min(JOG_SPEED_MAX, (
+            JOG_SPEED_DEFAULT
+            + (JOG_SPEED_MAX - JOG_SPEED_DEFAULT) * faster
+            - (JOG_SPEED_DEFAULT - JOG_SPEED_MIN) * slower
+        )))
+
+        # Screen coordinates run down-positive; negate so pushing forward
+        # drives the axis positive, matching the TCA and the web joystick.
+        pair_one = (axis(PAD_LEFT_X), -axis(PAD_LEFT_Y))
+        pair_two = (axis(PAD_RIGHT_X), -axis(PAD_RIGHT_Y))
+        speed_pairs = {
+            "JOINT": ((0.25, 0.25), (0.25, 0.25)),
+            "CARTESIAN": ((0.03, 0.03), (0.03, 0.35)),
+            "CYLINDRICAL": ((0.025, 0.20), (0.025, 0.35)),
+        }[normalized]
+        values = [0.0] * 6
+        for slot, (vx, vy) in enumerate((pair_one, pair_two)):
+            x_speed, y_speed = speed_pairs[slot]
+            values[slot * 2] = vx * x_speed * self.jog_speed_scale
+            values[slot * 2 + 1] = vy * y_speed * self.jog_speed_scale
+        self.pub_web_jog.publish(Float64MultiArray(data=values))
+        return True, ""
 
     def request_arm_target(
         self, mode: str, values: List[float]
@@ -3098,20 +3239,23 @@ const webJogSchemas={JOINT:[['Joint 1','Joint 2'],['Joint 3','Joint 4'],['Joint 
 function webJogMode(){return document.getElementById('web_jog_mode')?.value||'JOINT'}
 function renderWebJogAxes(){const host=document.getElementById('web_jog_axes');if(!host)return;const pairs=webJogSchemas[webJogMode()]||webJogSchemas.JOINT;host.replaceChildren(...pairs.map((pair,index)=>{const b=document.createElement('button');b.type='button';b.textContent=pair.join(' / ');b.className=index===webJogPair?'selected':'';b.onclick=()=>{releaseWebJog();webJogPair=index;renderWebJogAxes()};return b}))}
 function controlSource(){return document.getElementById('control_source')?.value||'web'}
-function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=controlSource()==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
+function updateWebJogAvailability(d){if(typeof d.control_mode_value==='string')armControlMode=d.control_mode_value;webJogAllowed=!!d.remote_enabled&&['JOINT','CARTESIAN','CYLINDRICAL'].includes(armControlMode)&&!d.arm_target_active&&!d.pickup_busy&&!d.object_tracking_active&&!d.object_search_active&&!d.arm_stack_busy;const airbusReady=webJogAllowed&&['CARTESIAN','CYLINDRICAL'].includes(armControlMode);const stick=document.getElementById('web_stick');if(stick)stick.classList.toggle('disabled',!webJogAllowed||controlSource()!=='web');const source=controlSource();const out=document.getElementById('web_jog_readout');if(out&&!webJogHeld)out.textContent=source==='airbus'?(airbusReady?'Airbus TCA active · '+armControlMode+'.':'Select CARTESIAN or CYLINDRICAL in arm ownership first.'):source==='gamepad'?(webJogAllowed?'Logitech F710 active · '+armControlMode+'. Left stick pair 1, right stick pair 2, LT/RT speed.':'Enable streaming control and select an accepted mode first.'):(webJogAllowed?'Ready — hold and drag to jog.':'Enable streaming control and select an accepted mode first.');syncJogSpeed(d);if((!webJogAllowed||controlSource()!=='web')&&webJogHeld)releaseWebJog()}
 function setWebJogKnob(x,y){const knob=document.getElementById('web_stick_knob');if(knob)knob.style.transform='translate(calc(-50% + '+(x*62)+'px),calc(-50% + '+(-y*62)+'px))'}
 async function sendWebJog(zero=false){if(!zero&&!webJogAllowed)return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode:webJogMode(),axis_pair:String(webJogPair),x:String(zero?0:webJogX),y:String(zero?0:webJogY)});try{const r=await fetch('/web_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok&&!zero){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Joystick command rejected.','bad',6000);releaseWebJog()}}catch(e){if(!zero){showActionNotice('Joystick connection lost.','bad',6000);releaseWebJog()}}}
 function releaseWebJog(){const wasHeld=webJogHeld;webJogHeld=false;webJogX=0;webJogY=0;if(webJogTimer){clearInterval(webJogTimer);webJogTimer=null}setWebJogKnob(0,0);if(wasHeld)sendWebJog(true)}
 function updateWebJogPointer(e){const stick=document.getElementById('web_stick');if(!stick)return;const r=stick.getBoundingClientRect(),radius=Math.min(r.width,r.height)*.38;let x=(e.clientX-(r.left+r.width/2))/radius,y=-(e.clientY-(r.top+r.height/2))/radius,len=Math.hypot(x,y);if(len>1){x/=len;y/=len}webJogX=x;webJogY=y;setWebJogKnob(x,y);const out=document.getElementById('web_jog_readout'),labels=(webJogSchemas[webJogMode()]||webJogSchemas.JOINT)[webJogPair];if(out)out.textContent=labels[0]+': '+x.toFixed(2)+' · '+labels[1]+': '+y.toFixed(2)}
 let jogSpeedDragging=false;
 function sendJogSpeed(percent){const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',scale:String(percent/100)});fetch('/jog_speed',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()}).then(async r=>{if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Speed change rejected.','bad',5000)}}).catch(()=>showActionNotice('Speed change failed.','bad',5000))}
-function paintJogSpeed(percent,airbus){const label=document.getElementById('jog_speed_value');if(!label)return;label.textContent=percent+'%'+(airbus?' · LIFT':'');label.classList.toggle('fast',percent>100)}
-function syncJogSpeed(d){const slider=document.getElementById('jog_speed');if(!slider)return;const airbus=controlSource()==='airbus';slider.disabled=airbus;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);paintJogSpeed(percent,airbus)}
-function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{paintJogSpeed(Number(speed.value),false)});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
+function speedOwner(){const s=controlSource();return s==='airbus'?' · LIFT':s==='gamepad'?' · LT/RT':''}
+function paintJogSpeed(percent,suffix){const label=document.getElementById('jog_speed_value');if(!label)return;label.textContent=percent+'%'+(suffix||'');label.classList.toggle('fast',percent>100)}
+function syncJogSpeed(d){const slider=document.getElementById('jog_speed');if(!slider)return;const suffix=speedOwner();slider.disabled=!!suffix;if(jogSpeedDragging||typeof d.jog_speed_scale!=='number')return;const percent=Math.round(d.jog_speed_scale*100);slider.value=String(percent);paintJogSpeed(percent,suffix)}
+function setupWebJog(){const stick=document.getElementById('web_stick'),mode=document.getElementById('web_jog_mode'),source=document.getElementById('control_source');if(!stick||!mode)return;const speed=document.getElementById('jog_speed');if(speed){speed.addEventListener('pointerdown',()=>{jogSpeedDragging=true});['pointerup','pointercancel','blur'].forEach(n=>speed.addEventListener(n,()=>{jogSpeedDragging=false}));speed.addEventListener('input',()=>{paintJogSpeed(Number(speed.value),'')});speed.addEventListener('change',()=>{jogSpeedDragging=false;sendJogSpeed(Number(speed.value))})}mode.onchange=()=>{releaseWebJog();webJogPair=0;renderWebJogAxes()};source?.addEventListener('change',()=>{releaseWebJog();pollStatus()});stick.onpointerdown=e=>{if(!webJogAllowed||controlSource()!=='web')return;e.preventDefault();stick.setPointerCapture?.(e.pointerId);webJogHeld=true;updateWebJogPointer(e);sendWebJog();webJogTimer=setInterval(sendWebJog,40)};stick.onpointermove=e=>{if(webJogHeld)updateWebJogPointer(e)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>stick.addEventListener(n,releaseWebJog));window.addEventListener('blur',releaseWebJog);window.addEventListener('pagehide',releaseWebJog);renderWebJogAxes();updateWebJogAvailability({})}
 function renderFlightAnalog(a){const axis=i=>Math.max(-1,Math.min(1,Number(a[i]||0)));const set=(id,prop,val)=>{const el=document.getElementById(id);if(el)el.style.setProperty(prop,val)};set('flight_stick_big_knob','--x',axis(0));set('flight_stick_big_knob','--y',axis(1));set('flight_stick_small_knob','--x',axis(4));set('flight_stick_small_knob','--y',axis(5));set('flight_stick_yaw','--yaw',axis(2));set('flight_stick_lift_knob','--v',axis(3))}
 async function sendAirbusJog(){if(controlSource()!=='airbus'||!webJogAllowed)return;const mode=armControlMode;if(!['CARTESIAN','CYLINDRICAL'].includes(mode))return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||'',mode});try{const r=await fetch('/airbus_jog',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus joystick command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus joystick connection lost.','bad',6000)}}
 async function sendAirbusGripper(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_gripper',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Airbus gripper command rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus gripper connection lost.','bad',6000)}}
 async function sendAirbusRest(){if(controlSource()!=='airbus')return;const body=new URLSearchParams({csrf:document.getElementById('web_jog')?.dataset.csrf||''});try{const r=await fetch('/airbus_rest',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Rest-position request rejected.','bad',6000)}}catch(_error){showActionNotice('Airbus rest-position connection lost.','bad',6000)}}
+async function sendGamepad(path,extra){const body=new URLSearchParams(Object.assign({csrf:document.getElementById('web_jog')?.dataset.csrf||''},extra||{}));try{const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'fetch'},body:body.toString()});if(!r.ok){const d=await r.json().catch(()=>({}));showActionNotice(d.message||'Gamepad command rejected.','bad',6000)}}catch(_error){showActionNotice('Gamepad connection lost.','bad',6000)}}
+async function pollGamepad(){const readout=document.getElementById('gamepad_state');try{const r=await fetch('/gamepad.json?'+Date.now(),{cache:'no-store'}),d=await r.json();if(readout)readout.textContent=d.connected?(d.device+' ('+d.path+') · '+(d.buttons||[]).length+' held'):'No gamepad detected';if(controlSource()!=='gamepad')return;await sendGamepad('/gamepad_gripper');await sendGamepad('/gamepad_rest');if(webJogAllowed)await sendGamepad('/gamepad_jog',{mode:armControlMode})}catch(_error){if(readout)readout.textContent='Gamepad monitor unavailable'}}
 async function pollFlightStick(){const card=document.getElementById('flight_stick');if(!card)return;try{const r=await fetch('/flight_stick.json?'+Date.now(),{cache:'no-store'}),d=await r.json();renderFlightAnalog(d.axes||[]);sendAirbusJog();sendAirbusGripper();sendAirbusRest();const device=document.getElementById('flight_stick_device'),event=document.getElementById('flight_stick_event'),axes=document.getElementById('flight_stick_axes');if(device)device.textContent=d.connected?(d.device+' ('+d.path+')'):'No joystick detected in /dev/input/js*';if(event)event.textContent=d.last_event||'';document.querySelectorAll('#flight_stick [data-btn]').forEach(b=>b.classList.toggle('down',(d.buttons||[]).includes(Number(b.dataset.btn))));if(axes){axes.replaceChildren(...(d.axes||[]).map((v,i)=>{const row=document.createElement('div');row.className='flightstick-axis';row.innerHTML='<span>Axis '+(i+1)+'</span><strong>'+Number(v).toFixed(3)+'</strong>';return row}))}}catch(_error){const device=document.getElementById('flight_stick_device');if(device)device.textContent='Flight-stick monitor unavailable';}}
 
 // Dependency-free OM6DOF kinematic viewer. Dimensions and axes mirror
@@ -3532,6 +3676,8 @@ document.addEventListener('DOMContentLoaded',function(){
   setupWebJog();
   pollFlightStick();
   setInterval(pollFlightStick,100);
+  pollGamepad();
+  setInterval(pollGamepad,100);
 });
 </script>
 """
@@ -4111,6 +4257,7 @@ def render_page(
       <select class="targetmode" id="control_source">
         <option value="web">Web analog (default)</option>
         <option value="airbus">Airbus TCA analog</option>
+        <option value="gamepad">Logitech F710 gamepad</option>
       </select>
       <div class="btnrow">
         <form class="inline" method="POST" action="/mode_joint">
@@ -4170,6 +4317,7 @@ def render_page(
             <span class="mono" id="jog_speed_value">100%</span>
           </div>
           <p class="mono jogreadout" id="web_jog_readout">Loading controller state…</p>
+          <p class="small" id="gamepad_state">Scanning for a gamepad…</p>
         </div>
       </div>
       <p class="small jogwarning">Hold-to-move only. Release the stick to stop.
@@ -4779,6 +4927,11 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     return self._send_json(node.flight_stick.snapshot())
                 except Exception as exc:
                     return self._send_json({"connected": False, "error": str(exc)}, 500)
+            if self.path.startswith("/gamepad.json"):
+                try:
+                    return self._send_json(node.gamepad.snapshot())
+                except Exception as exc:
+                    return self._send_json({"connected": False, "error": str(exc)}, 500)
             if self.path.startswith("/status.json"):
                 try:
                     return self._send_json(status_fields(node, cam, audio))
@@ -5072,6 +5225,20 @@ def make_handler(node: MonitorNode, cam: ForwardedImageStream, audio=None):
                     if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
                         return self._send_json({"ok": False, "message": "Invalid control token."}, 403)
                     ok, message = node.request_airbus_rest()
+                except (UnicodeError, ValueError) as exc:
+                    return self._send_json({"ok": False, "message": str(exc)}, 400)
+                return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            if self.path in ("/gamepad_jog", "/gamepad_gripper", "/gamepad_rest"):
+                try:
+                    form = self._read_form(512)
+                    if not csrf_token_matches(form.get("csrf", ""), node.csrf_token):
+                        return self._send_json({"ok": False, "message": "Invalid control token."}, 403)
+                    if self.path == "/gamepad_jog":
+                        ok, message = node.request_gamepad_jog(form.get("mode", ""))
+                    elif self.path == "/gamepad_gripper":
+                        ok, message = node.request_gamepad_gripper()
+                    else:
+                        ok, message = node.request_gamepad_rest()
                 except (UnicodeError, ValueError) as exc:
                     return self._send_json({"ok": False, "message": str(exc)}, 400)
                 return self._send_json({"ok": ok, "message": message}, 200 if ok else 409)

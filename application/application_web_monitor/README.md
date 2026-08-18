@@ -81,6 +81,51 @@ The 3D arm viewport stays dark in both themes. Its canvas paints its own
 scene from JavaScript, and a dark viewport inside a light application is the
 normal convention for 3D views.
 
+## Choosing a controller
+
+Three sources can drive the arm, selected in **Control source** on the arm
+ownership card. Only the selected one is ever sent, so two sticks can stay
+plugged in without fighting each other:
+
+| Source | Device |
+|---|---|
+| Web analog | the browser joystick in the dashboard |
+| Airbus TCA analog | Thrustmaster T.A320, `/dev/input/js0` here |
+| Logitech F710 gamepad | Logitech/Logicool F710 in XInput mode, `js1` here |
+
+Each reader matches its own device by USB product name, so device order does
+not matter. The TCA reader still adopts an unrecognised stick — that is what
+keeps a TCA reporting an odd firmware name working — but it explicitly skips
+anything that looks like a gamepad, so the fallback cannot steal `js1`. The
+gamepad reader only ever takes a name match.
+
+### Logitech F710 mapping
+
+The F710 reports 8 axes and 11 buttons in XInput mode, so none of the TCA's
+mapping carries over and it gets its own profile:
+
+| Control | Action |
+|---|---|
+| Left stick | axis pair 1 |
+| Right stick | axis pair 2 |
+| RT | speed up, toward 200% |
+| LT | speed down, toward 15% |
+| A | grip |
+| B | release |
+| Start | toggle REST/READY |
+
+Neither trigger pressed is the tuned rate; the triggers are read as absolute
+positions rather than integrated, so the speed never drifts. On the `xpad`
+driver they rest at `-1.0` and reach `+1.0`, which is why the code normalises
+with `(value + 1) / 2` — a driver that rested at `0.0` instead would need that
+changed. Pushing a stick forward drives its axis positive, matching the TCA and
+the web joystick.
+
+The buttons and axes are named at module scope as `PAD_*` in `web_monitor.py`;
+remap there. Gripper and REST/READY handling is shared with the TCA through
+`_gripper_from_stick` and `_rest_from_stick`, so the guards and the commanded
+gripper positions cannot drift apart between the two controllers.
+
 ## Thrustmaster TCA flight-stick monitor
 
 When a USB flight stick is connected, the dashboard shows a **Flight stick
